@@ -1,5 +1,5 @@
 import { EventEmitter, once } from "node:events";
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -9,7 +9,7 @@ import { backgroundSnapshotCapacity, createGatewayApp } from "../src/server/app.
 import type { GatewayConfig } from "../src/server/config.js";
 import { GatewayLogger, RollingGatewayMetrics } from "../src/server/diagnostics.js";
 import { SessionStore } from "../src/server/sessions.js";
-import type { ModelListResult, RpcId, ThreadSummary } from "../src/shared/types.js";
+import type { ModelListResult, RpcId, ThreadSummary, TurnInput } from "../src/shared/types.js";
 
 class MockUpstream extends EventEmitter {
   public readonly initializeResult = { platformOs: "windows" };
@@ -77,8 +77,8 @@ class MockUpstream extends EventEmitter {
     return { thread: { id: threadId, status: this.threadStatus }, ...this.resumeSettings };
   }
 
-  public async startTurn(threadId: string, text: string, settings: { model?: string | null; effort?: string | null } = {}): Promise<{ turn: { id: string } }> {
-    this.calls.push({ method: "turn/start", params: { threadId, text, ...settings } });
+  public async startTurn(threadId: string, input: string | TurnInput[], settings: { model?: string | null; effort?: string | null } = {}): Promise<{ turn: { id: string } }> {
+    this.calls.push({ method: "turn/start", params: { threadId, ...(typeof input === "string" ? { text: input } : { input }), ...settings } });
     const error = this.startErrors.shift() ?? this.startError;
     if (error) throw error;
     this.onStartTurn?.();
@@ -102,8 +102,8 @@ class MockUpstream extends EventEmitter {
     return { status: "unsubscribed" };
   }
 
-  public async steerTurn(threadId: string, turnId: string, text: string): Promise<{ turnId: string }> {
-    this.calls.push({ method: "turn/steer", params: { threadId, turnId, text } });
+  public async steerTurn(threadId: string, turnId: string, input: string | TurnInput[]): Promise<{ turnId: string }> {
+    this.calls.push({ method: "turn/steer", params: { threadId, turnId, ...(typeof input === "string" ? { text: input } : { input }) } });
     return { turnId };
   }
 
@@ -143,6 +143,7 @@ describe("authenticated phase-2 gateway", () => {
     const rejected = await app.inject({ method: "POST", url: "/api/threads/thread-1/turns", payload: { text: "hello" } });
     expect(rejected.statusCode).toBe(401);
     expect(rejected.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+    expect(rejected.headers["content-security-policy"]).toContain("img-src 'self' data: blob:");
     expect(rejected.headers["permissions-policy"]).toBe("camera=(), microphone=(), geolocation=()");
     expect(rejected.headers["referrer-policy"]).toBe("no-referrer");
     expect(rejected.headers["x-content-type-options"]).toBe("nosniff");
@@ -272,6 +273,62 @@ describe("authenticated phase-2 gateway", () => {
     expect(upstream.metadataReads.filter(read => read.priority === "foreground")).toHaveLength(13);
     expect(upstream.calls.filter(call => call.method === "turn/start").map(call => (call.params as { threadId: string }).threadId).sort()).toEqual(["thread-1", "thread-1", "thread-10", "thread-12", "thread-2", "thread-3", "thread-4", "thread-5", "thread-6", "thread-9"]);
     expect(upstream.calls.filter(call => call.method === "turn/steer" || call.method === "turn/interrupt").map(call => call.method)).toEqual(["turn/steer", "turn/steer", "turn/interrupt"]);
+  });
+
+  it("uploads authenticated images and sends localImage input without exposing arbitrary files", async () => {
+    const secret = "i".repeat(32);
+    const uploadRoot = await mkdtemp(join(tmpdir(), "codex-mobile-images-"));
+    const upstream = new MockUpstream();
+    const config: GatewayConfig = {
+      appServerUrl: "ws://127.0.0.1:4500",
+      pairingSecret: secret,
+      host: "127.0.0.1",
+      port: 4174,
+      staticRoot: "C:\\missing-codex-mobile-static-root",
+      logFile: null,
+      sessionTtlMs: 60_000,
+      sessionStoreFile: null,
+      imageUploadRoot: uploadRoot
+    };
+    try {
+      app = await createGatewayApp(config, upstream as unknown as AppServerClient);
+      const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+      const rejected = await app.inject({ method: "POST", url: "/api/images", headers: { "content-type": "image/png" }, payload: png });
+      expect(rejected.statusCode).toBe(401);
+
+      const login = await app.inject({ method: "POST", url: "/api/auth/session", payload: { token: secret } });
+      const cookie = String(login.headers["set-cookie"]).split(";", 1)[0];
+      const invalid = await app.inject({ method: "POST", url: "/api/images", headers: { cookie, "content-type": "image/jpeg" }, payload: png });
+      expect(invalid.statusCode).toBe(415);
+
+      const uploaded = await app.inject({ method: "POST", url: "/api/images", headers: { cookie, "content-type": "image/png" }, payload: png });
+      expect(uploaded.statusCode).toBe(201);
+      const imageId = uploaded.json().imageId as string;
+      expect(imageId).toMatch(/\.png$/);
+      const fetched = await app.inject({ method: "GET", url: `/api/images/${imageId}`, headers: { cookie } });
+      expect(fetched.statusCode).toBe(200);
+      expect(fetched.headers["content-type"]).toContain("image/png");
+      expect(fetched.rawPayload).toEqual(png);
+
+      const imageOnly = await app.inject({ method: "POST", url: "/api/threads/thread-image/turns", headers: { cookie }, payload: { images: [imageId], requestId: "image-only-turn-0001" } });
+      expect(imageOnly.statusCode).toBe(200);
+      expect(upstream.calls).toContainEqual({
+        method: "turn/start",
+        params: { threadId: "thread-image", input: [{ type: "localImage", path: join(uploadRoot, imageId), detail: "auto" }] }
+      });
+      upstream.turns = [{ id: "turn-image", items: [{ id: "user-image", type: "userMessage", content: [{ type: "localImage", path: join(uploadRoot, imageId), detail: "auto" }] }] }];
+      const history = await app.inject({ method: "GET", url: "/api/threads/thread-image", headers: { cookie } });
+      expect(history.json().thread.turns[0].items[0].content).toEqual([{ type: "localImage", path: imageId, detail: "auto" }]);
+
+      const missing = await app.inject({ method: "POST", url: "/api/threads/thread-image/turns", headers: { cookie }, payload: { images: ["00000000-0000-4000-8000-000000000000.png"], requestId: "missing-image-0001" } });
+      expect(missing.statusCode).toBe(400);
+      const traversal = await app.inject({ method: "GET", url: "/api/images/not-an-upload.png", headers: { cookie } });
+      expect(traversal.statusCode).toBe(404);
+    } finally {
+      await app?.close();
+      app = undefined;
+      await rm(uploadRoot, { recursive: true, force: true });
+    }
   });
 
   it("reads persisted task parameters through the authenticated on-demand route", async () => {

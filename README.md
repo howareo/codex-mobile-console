@@ -76,6 +76,8 @@ https://<WINDOWS_PRIVATE_IP>:4174/
 
 手机和桌面端使用同一套任务与聊天记录。
 
+聊天输入栏支持一次选择最多 4 张图片。较大的照片会先在手机端压缩，再通过已认证的 4174 HTTPS 网关保存到 Windows 的 `.runtime\private\uploads\images`，随后以 `localImage` 交给共享 4500；图片文件和密钥一样不会提交到 Git。
+
 ## 部署（新机器第一次安装）
 
 部署位置是 Windows 本机，不是 WSL。需要先准备：

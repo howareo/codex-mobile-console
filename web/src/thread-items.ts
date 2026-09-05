@@ -66,6 +66,18 @@ export function itemText(item: unknown): string {
   return "";
 }
 
+export function itemImages(item: unknown): Array<{ imageId: string; src: string }> {
+  const content = itemRecord(item).content;
+  if (!Array.isArray(content)) return [];
+  return content.flatMap(value => {
+    const input = itemRecord(value);
+    if (input.type !== "localImage" || typeof input.path !== "string") return [];
+    const imageId = input.path.replaceAll("\\", "/").split("/").at(-1) || "";
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|png|webp|gif)$/i.test(imageId)) return [];
+    return [{ imageId, src: `/api/images/${encodeURIComponent(imageId)}` }];
+  });
+}
+
 // 统一读取 app-server 返回的字符串状态和对象状态。
 export function statusValue(value: unknown): string {
   if (typeof value === "string") return value;

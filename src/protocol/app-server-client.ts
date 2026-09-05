@@ -12,6 +12,7 @@ import type {
   ThreadResumeResult,
   ThreadTurnsListResult,
   ThreadUnsubscribeResult,
+  TurnInput,
   TurnResult,
   TurnSteerResult
 } from "../shared/types.js";
@@ -237,15 +238,17 @@ export class AppServerClient extends EventEmitter {
     }, priority);
   }
 
-  public async startTurn(threadId: string, text: string, settings: { model?: string | null; effort?: string | null } = {}): Promise<TurnResult> {
-    return this.request<TurnResult>("turn/start", { threadId, input: [{ type: "text", text }], ...settings });
+  public async startTurn(threadId: string, input: string | TurnInput[], settings: { model?: string | null; effort?: string | null } = {}): Promise<TurnResult> {
+    const items: TurnInput[] = typeof input === "string" ? [{ type: "text", text: input }] : input;
+    return this.request<TurnResult>("turn/start", { threadId, input: items, ...settings });
   }
 
-  public async steerTurn(threadId: string, turnId: string, text: string): Promise<TurnSteerResult> {
+  public async steerTurn(threadId: string, turnId: string, input: string | TurnInput[]): Promise<TurnSteerResult> {
+    const items: TurnInput[] = typeof input === "string" ? [{ type: "text", text: input }] : input;
     return this.request<TurnSteerResult>("turn/steer", {
       threadId,
       expectedTurnId: turnId,
-      input: [{ type: "text", text }]
+      input: items
     });
   }
 

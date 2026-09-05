@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mergeThreadPage } from "../web/src/thread-history";
-import { itemDetails, itemRole, itemSummary, statusClass, statusText, toolLabel } from "../web/src/thread-items";
+import { itemDetails, itemImages, itemRole, itemSummary, statusClass, statusText, toolLabel } from "../web/src/thread-items";
 import { formatConversationTime, formatDurationMs, turnDurationMs } from "../web/src/time-format";
 import { interruptErrorText, sendErrorText, turnErrorText } from "../web/src/error-text";
 import { latestPlanFromTurn, parsePlanText, planNotification, planProgress, planSnapshotKey } from "../web/src/plan-state";
@@ -48,6 +48,14 @@ describe("移动端消息呈现", () => {
     expect(statusText("interrupted")).toBe("已停止");
     expect(turnErrorText({ status: "systemError", error: { message: "unexpected status 502 Bad Gateway: 当前服务拥挤，请重试。, url: http://localhost:3001/v1/responses", additionalDetails: "upstream overloaded" } })).toContain("当前服务拥挤，请重试");
     expect(turnErrorText({ status: "systemError", error: { message: "unexpected status 502", additionalDetails: "token=private-secret" } })).not.toContain("private-secret");
+  });
+
+  it("只把网关上传的图片映射为认证图片地址", () => {
+    const imageId = "123e4567-e89b-42d3-a456-426614174000.png";
+    expect(itemImages({ type: "userMessage", content: [{ type: "text", text: "看图" }, { type: "localImage", path: `C:\\private\\${imageId}` }] })).toEqual([
+      { imageId, src: `/api/images/${imageId}` }
+    ]);
+    expect(itemImages({ type: "userMessage", content: [{ type: "localImage", path: "C:\\Users\\Public\\photo.png" }] })).toEqual([]);
   });
 
   it("保持暗色面层和高对比档的边界对比度", () => {

@@ -125,6 +125,10 @@ export interface TurnSteerResult {
   turnId: string;
 }
 
+export type TurnInput =
+  | { type: "text"; text: string }
+  | { type: "localImage"; path: string; detail?: "auto" | "low" | "high" | "original" | null };
+
 export interface ModelServiceTier {
   id: string;
   name: string;

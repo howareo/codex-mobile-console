@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { basename, dirname, extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
@@ -8,7 +8,7 @@ import fastifyStatic from "@fastify/static";
 import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
 import { AppServerClient, type AppServerFrame, type AppServerRequestPriority } from "../protocol/app-server-client.js";
-import type { ApprovalRequest, JsonObject, LoadedTasksDiagnosticsResult, ModelListResult, RpcId, RpcNotification, ThreadMetadataResult, ThreadPageResult, ThreadSummary } from "../shared/types.js";
+import type { ApprovalRequest, JsonObject, LoadedTasksDiagnosticsResult, ModelListResult, RpcId, RpcNotification, ThreadMetadataResult, ThreadPageResult, ThreadSummary, TurnInput } from "../shared/types.js";
 import type { GatewayConfig } from "./config.js";
 import { GatewayLogger, RollingGatewayMetrics, type LogLevel } from "./diagnostics.js";
 import { SessionStore } from "./sessions.js";
@@ -27,6 +27,10 @@ const MAX_THREAD_LIST_PAGES = 100;
 const MAX_MODEL_LIST_PAGES = 100;
 const UNSUBSCRIBE_RETRY_ATTEMPTS = 3;
 const UNSUBSCRIBE_RETRY_DELAYS_MS = [100, 300] as const;
+const MAX_IMAGES_PER_TURN = 4;
+const MAX_IMAGE_UPLOAD_BYTES = 8 * 1024 * 1024;
+const IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"] as const;
+type ImageMimeType = typeof IMAGE_MIME_TYPES[number];
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval",
@@ -81,6 +85,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   let snapshotFlushTimer: ReturnType<typeof setTimeout> | undefined;
   await app.register(cookie);
   await app.register(websocket);
+  app.addContentTypeParser([...IMAGE_MIME_TYPES], { parseAs: "buffer", bodyLimit: MAX_IMAGE_UPLOAD_BYTES }, (_request, body, done) => done(null, body));
 
   // Fastify's default 500 response hides the useful upstream message. Keep
   // the status and reason visible to the mobile client, while removing fields
@@ -94,7 +99,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   app.addHook("onRequest", async (request, reply) => {
     reply.headers({
-      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+      "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
       "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
       "Referrer-Policy": "no-referrer",
       "X-Content-Type-Options": "nosniff",
@@ -504,6 +509,36 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     return { ok: true };
   });
 
+  app.post<{ Body: Buffer }>("/api/images", { onRequest: requireSession, bodyLimit: MAX_IMAGE_UPLOAD_BYTES }, async (request, reply) => {
+    if (!config.imageUploadRoot) return reply.code(503).send({ error: "image uploads are not configured" });
+    const body = request.body;
+    if (!Buffer.isBuffer(body) || body.length === 0) return reply.code(400).send({ error: "image body is required" });
+    const requestedMime = imageMimeType(request.headers["content-type"]);
+    const detectedMime = detectImageMime(body);
+    if (!requestedMime || !detectedMime || requestedMime !== detectedMime) return reply.code(415).send({ error: "unsupported or invalid image" });
+    const imageId = `${randomUUID()}${imageExtension(detectedMime)}`;
+    const path = uploadedImagePath(config.imageUploadRoot, imageId);
+    if (!path) return reply.code(400).send({ error: "invalid image id" });
+    await mkdir(config.imageUploadRoot, { recursive: true, mode: 0o700 });
+    await writeFile(path, body, { flag: "wx", mode: 0o600 });
+    logger.info("image.uploaded", { requestId: request.id, imageId, mimeType: detectedMime, size: body.length });
+    return reply.code(201).send({ imageId, mimeType: detectedMime, size: body.length });
+  });
+
+  app.get<{ Params: { imageId: string } }>("/api/images/:imageId", { preHandler: requireSession }, async (request, reply) => {
+    if (!config.imageUploadRoot) return reply.code(404).send({ error: "image not found" });
+    const path = uploadedImagePath(config.imageUploadRoot, request.params.imageId);
+    const mimeType = imageMimeFromExtension(request.params.imageId);
+    if (!path || !mimeType) return reply.code(404).send({ error: "image not found" });
+    try {
+      const body = await readFile(path);
+      return reply.type(mimeType).header("Cache-Control", "private, max-age=3600").send(body);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return reply.code(404).send({ error: "image not found" });
+      throw error;
+    }
+  });
+
   app.get("/api/threads", { preHandler: requireSession }, async () => loadThreadList());
 
   // Detail history stays turns-only. Session parameters are fetched only when
@@ -522,9 +557,28 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     return loadThreadPage(request.params.threadId, request.query.cursor);
   });
 
-  app.post<{ Params: { threadId: string }; Body: { text?: string; activeTurnId?: string; requestId?: string; model?: string | null; reasoningEffort?: string | null } }>("/api/threads/:threadId/turns", { preHandler: requireSession }, async (request, reply) => {
+  app.post<{ Params: { threadId: string }; Body: { text?: string; images?: unknown; activeTurnId?: string; requestId?: string; model?: string | null; reasoningEffort?: string | null } }>("/api/threads/:threadId/turns", { preHandler: requireSession }, async (request, reply) => {
     const text = typeof request.body?.text === "string" ? request.body.text.trim() : "";
-    if (!text) return reply.code(400).send({ error: "message text is required" });
+    const imageIds = turnImageIds(request.body?.images);
+    if (imageIds === null) return reply.code(400).send({ error: `images must contain at most ${MAX_IMAGES_PER_TURN} uploaded image ids` });
+    if (!text && imageIds.length === 0) return reply.code(400).send({ error: "message text or image is required" });
+    if (imageIds.length > 0 && !config.imageUploadRoot) return reply.code(503).send({ error: "image uploads are not configured" });
+    const imagePaths: string[] = [];
+    for (const imageId of imageIds) {
+      const path = config.imageUploadRoot ? uploadedImagePath(config.imageUploadRoot, imageId) : null;
+      if (!path) return reply.code(400).send({ error: "invalid uploaded image id" });
+      try {
+        await access(path);
+      } catch {
+        return reply.code(400).send({ error: "uploaded image not found" });
+      }
+      imagePaths.push(path);
+    }
+    const turnInput: TurnInput[] = [
+      ...(text ? [{ type: "text" as const, text }] : []),
+      ...imagePaths.map(path => ({ type: "localImage" as const, path, detail: "auto" as const }))
+    ];
+    const upstreamInput: string | TurnInput[] = imagePaths.length > 0 ? turnInput : text;
     const requestId = mobileRequestId(request.body?.requestId);
     if (!requestId) return reply.code(400).send({ error: "invalid request id" });
     const receiptKey = `${request.params.threadId}:${requestId}`;
@@ -549,7 +603,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     const action = (async () => {
       if (activeTurnId) {
         await ensureThreadSubscription(request.params.threadId);
-        const result = await upstream.steerTurn(request.params.threadId, activeTurnId, text);
+        const result = await upstream.steerTurn(request.params.threadId, activeTurnId, upstreamInput);
         threadListCache = null;
         return { requestId, acceptedAt, mode: "steer", ...result };
       }
@@ -585,14 +639,14 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
       let recovered = false;
       let result;
       try {
-        result = await upstream.startTurn(request.params.threadId, text, startSettings);
+        result = await upstream.startTurn(request.params.threadId, upstreamInput, startSettings);
       } catch (error) {
         if (!isThreadNotFoundError(error)) throw error;
         recovered = true;
         logger.warn("write.resume_after_thread_not_found", { requestId, threadId: request.params.threadId });
         subscribedThreads.delete(request.params.threadId);
         await ensureThreadSubscription(request.params.threadId);
-        result = await upstream.startTurn(request.params.threadId, text, startSettings);
+        result = await upstream.startTurn(request.params.threadId, upstreamInput, startSettings);
       }
       threadListCache = null;
       return {
@@ -830,6 +884,42 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   return app;
 }
 
+function imageMimeType(value: string | string[] | undefined): ImageMimeType | null {
+  const mimeType = (Array.isArray(value) ? value[0] : value)?.split(";", 1)[0]?.trim().toLowerCase();
+  return IMAGE_MIME_TYPES.includes(mimeType as ImageMimeType) ? mimeType as ImageMimeType : null;
+}
+
+function detectImageMime(value: Buffer): ImageMimeType | null {
+  if (value.length >= 8 && value.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (value.length >= 3 && value[0] === 0xff && value[1] === 0xd8 && value[2] === 0xff) return "image/jpeg";
+  if (value.length >= 6 && ["GIF87a", "GIF89a"].includes(value.subarray(0, 6).toString("ascii"))) return "image/gif";
+  if (value.length >= 12 && value.subarray(0, 4).toString("ascii") === "RIFF" && value.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  return null;
+}
+
+function imageExtension(mimeType: ImageMimeType): string {
+  return ({ "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif" } as const)[mimeType];
+}
+
+function imageMimeFromExtension(imageId: string): ImageMimeType | null {
+  return ({ ".jpg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif" } as Record<string, ImageMimeType>)[extname(imageId).toLowerCase()] ?? null;
+}
+
+function uploadedImagePath(root: string, imageId: string): string | null {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|png|webp|gif)$/i.test(imageId)) return null;
+  const resolvedRoot = resolve(root);
+  const resolvedPath = resolve(resolvedRoot, imageId);
+  return dirname(resolvedPath) === resolvedRoot ? resolvedPath : null;
+}
+
+function turnImageIds(value: unknown): string[] | null {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > MAX_IMAGES_PER_TURN) return null;
+  const ids = value.filter((item): item is string => typeof item === "string" && item.length > 0);
+  if (ids.length !== value.length || new Set(ids).size !== ids.length) return null;
+  return ids;
+}
+
 function approvalResponse(approval: ApprovalRequest, decision: "accept" | "decline"): unknown {
   if (approval.method === "item/commandExecution/requestApproval" || approval.method === "item/fileChange/requestApproval") {
     return { decision: decision === "accept" ? "accept" : "decline" };
@@ -986,7 +1076,8 @@ function mobileItem(value: unknown): unknown {
   const projected: JsonObject = {};
   copyMobileFields(projected, item, ["id", "type", "status", "state", "createdAt", "updatedAt"]);
   if (type === "userMessage" || type === "agentMessage") {
-    copyMobileFields(projected, item, ["text", "content", "summary"]);
+    copyMobileFields(projected, item, ["text", "summary"]);
+    if (Array.isArray(item.content)) projected.content = item.content.slice(0, 40).map(mobileConversationInput).filter(value => value !== undefined);
     return projected;
   }
   if (type === "fileChange") {
@@ -1013,6 +1104,15 @@ function mobileItem(value: unknown): unknown {
   if (preview) projected.result = preview;
   if (Array.isArray(item.results)) projected.resultCount = item.results.length;
   return projected;
+}
+
+function mobileConversationInput(value: unknown): unknown {
+  const input = objectValue(value);
+  if (!input || typeof input.type !== "string") return compactMobileValue(value);
+  if (input.type === "localImage" && typeof input.path === "string") {
+    return { type: "localImage", path: basename(input.path), detail: compactMobileValue(input.detail) };
+  }
+  return compactMobileValue(value);
 }
 
 function copyMobileFields(target: JsonObject, source: JsonObject, keys: string[]): void {

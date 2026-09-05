@@ -11,6 +11,7 @@ export interface GatewayConfig {
   logFile: string | null;
   sessionTtlMs: number;
   sessionStoreFile: string | null;
+  imageUploadRoot?: string | null;
 }
 
 const DEFAULT_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
@@ -42,7 +43,8 @@ export async function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): P
     staticRoot: resolve(env.CODEX_MOBILE_STATIC_ROOT?.trim() || "dist/web"),
     logFile: resolve(env.CODEX_MOBILE_LOG_FILE?.trim() || ".runtime/gateway.ndjson"),
     sessionTtlMs: sessionTtlMs(env.CODEX_MOBILE_SESSION_TTL_MS),
-    sessionStoreFile: resolve(env.CODEX_MOBILE_SESSION_STORE_FILE?.trim() || ".runtime/private/sessions.json")
+    sessionStoreFile: resolve(env.CODEX_MOBILE_SESSION_STORE_FILE?.trim() || ".runtime/private/sessions.json"),
+    imageUploadRoot: resolve(env.CODEX_MOBILE_IMAGE_UPLOAD_ROOT?.trim() || ".runtime/private/uploads/images")
   };
   if (cert && key) result.tls = { cert, key };
   return result;
