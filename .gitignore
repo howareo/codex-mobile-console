@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.runtime/
+evidence/*
+!evidence/.gitkeep
+*.local
+*.log
+.DS_Store
