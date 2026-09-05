@@ -17,6 +17,8 @@ Set-Location $ProjectRoot
 .\scripts\codex-mobile.ps1 help
 ```
 
+协议参考文件见 [Codex app-server 协议基线](protocol/schema/codex-app-server-baseline/)。目录中的 `0.147.0-alpha.6.5` 只是协议快照的来源版本，不是本项目版本，也不会锁定 Codex Desktop 或共享 app-server 的运行版本；运行时版本由脚本从 Windows 主机上动态解析。
+
 ### 只记这四条
 
 | 目的 | 命令 | 是否会中断任务 |
