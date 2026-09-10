@@ -35,7 +35,7 @@ Codex 手机控制台统一管理入口
   Set-Location $ProjectRoot
 
 查看：
-  .\scripts\codex-mobile.ps1 status       查看进程、协议、配置和连接状态
+  .\scripts\codex-mobile.ps1 status       查看已安装版本、4500 实际版本、待切换目标和连接状态
   .\scripts\codex-mobile.ps1 diagnose     查看版本、PID、readyz 和历史错误计数
   .\scripts\codex-mobile.ps1 check-4500   实测 initialize + thread/list
 
@@ -68,7 +68,7 @@ Codex 手机控制台统一管理入口
   npm run build
   .\scripts\codex-mobile.ps1 restart
 
-升级或打不开时的顺序：status -> check-4500 -> diagnose；4500 未运行时用 start-4500，协议异常时在维护窗口用 restart-4500。不要编辑 state_5.sqlite，不要手动启动第二个 4500。
+升级后看门会连续确认完整安装 bundle 并预存快照，但不会打断正在使用的 4500。status 显示“版本切换待处理”时，关闭 Codex Desktop 和手机页面，先预览 restart-4500，再执行带确认词的维护重载。不要编辑 state_5.sqlite，不要手动启动第二个 4500。
 '@
 }
 

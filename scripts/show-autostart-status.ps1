@@ -1,9 +1,18 @@
 $TaskName = "Codex Mobile Console"
 $PSNativeCommandUseErrorActionPreference = $false
+. (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $info = if ($task) { Get-ScheduledTaskInfo -TaskName $TaskName } else { $null }
 $appServer = Get-NetTCPConnection -LocalPort 4500 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 $gateway = Get-NetTCPConnection -LocalPort 4174 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+$appOwner = if ($appServer) { Get-CimInstance Win32_Process -Filter "ProcessId=$($appServer.OwningProcess)" -ErrorAction SilentlyContinue } else { $null }
+$runningBinary = if ($appOwner) { [string]$appOwner.ExecutablePath } else { $null }
+$runningVersion = if ($runningBinary) { Get-CodexBinaryVersion -BinaryPath $runningBinary } else { $null }
+$installedBinary = try { Resolve-InstalledCodexBinary } catch { $null }
+$installedVersion = if ($installedBinary) { Get-CodexBinaryVersion -BinaryPath $installedBinary } else { $null }
+$pendingSwitchPath = Join-Path $PSScriptRoot '..\.runtime\pending-app-server-switch.json'
+$pendingSwitchExists = Test-Path -LiteralPath $pendingSwitchPath -PathType Leaf
+$pendingSwitch = Read-CodexBinaryRecord -Path $pendingSwitchPath
 $protocol = $null
 $protocolError = $null
 if ($appServer) {
@@ -47,12 +56,17 @@ $effectiveChangeKinds = if ($currentRecord -and $appliedRecord -and $currentReco
 $watchdog = if ($task -and ($task.Actions.Arguments -match "watch-mobile-stack\.ps1")) { "已启用" } else { "未启用或旧版" }
 $lastResult = if (-not $info) { "无" } elseif ($task.State -eq "Running") { "运行中（正常）" } elseif ($info.LastTaskResult -eq 0) { "成功" } else { "错误码 $($info.LastTaskResult)" }
 $configPending = $pendingRecord -or ($effectiveChangeKinds -and ($effectiveChangeKinds.provider -or $effectiveChangeKinds.credentials -or $effectiveChangeKinds.catalogs -or $effectiveChangeKinds.instructions -or $effectiveChangeKinds.hooks -or $effectiveChangeKinds.deployment))
+$gatewayPid = if ($gateway) { [int]$gateway.OwningProcess } else { 0 }
+$desktopClients = if ($appServer) { @(Get-NetTCPConnection -RemotePort 4500 -State Established -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -ne $gatewayPid } | Select-Object -ExpandProperty OwningProcess -Unique) } else { @() }
+$phoneConnections = if ($gateway) { @(Get-NetTCPConnection -LocalPort 4174 -State Established -ErrorAction SilentlyContinue) } else { @() }
+$binaryDrift = if ($installedBinary -and $runningBinary) { try { (Get-FileHash -LiteralPath $installedBinary -Algorithm SHA256).Hash -ne (Get-FileHash -LiteralPath $runningBinary -Algorithm SHA256).Hash } catch { $installedVersion -ne $runningVersion } } else { $false }
+$switchWaitReason = if ($pendingSwitch) { if ($desktopClients.Count -gt 0 -or $phoneConnections.Count -gt 0) { "等待连接清空（桌面/其他 PID：$(if ($desktopClients.Count) { $desktopClients -join ', ' } else { '无' })；手机连接：$($phoneConnections.Count)）" } else { '连接已清空；请执行维护窗口重载命令' } } elseif ($pendingSwitchExists) { '待切换标记无法解析；请执行 diagnose' } elseif ($binaryDrift) { '等待看门连续两次确认完整安装 bundle' } else { '无' }
 $overall = if (-not $appServer) {
   '停止'
 } elseif ($protocolError -or -not $protocol -or -not $protocol.ok) {
   '异常：4500 协议检查未通过'
-} elseif ($configPending) {
-  '需要维护：4500 协议可用，但磁盘配置尚未应用'
+} elseif ($configPending -or $pendingSwitchExists -or $binaryDrift) {
+  '需要维护：4500 协议可用，但配置或版本尚未应用'
 } elseif (-not $gateway) {
   '部分可用：4500 正常，4174 未运行'
 } else {
@@ -67,6 +81,10 @@ $overall = if (-not $appServer) {
   上次执行结果 = $lastResult
   上次启动时间 = if ($info) { $info.LastRunTime } else { "无" }
   '4500进程' = if ($appServer) { "运行中，PID $($appServer.OwningProcess)" } else { "未运行" }
+  '4500实际版本' = if ($runningVersion) { "$runningVersion（$runningBinary）" } else { '未运行或版本读取失败' }
+  '已安装版本' = if ($installedVersion) { "$installedVersion（$installedBinary）" } else { '未发现完整安装 bundle' }
+  '版本切换' = if ($pendingSwitch) { "待处理：$($pendingSwitch.version) -> $($pendingSwitch.snapshotBinary)" } elseif ($pendingSwitchExists) { '待处理标记无法解析' } elseif ($binaryDrift) { '磁盘安装版本与 4500 不同，等待看门连续确认并登记' } else { '已一致' }
+  '版本等待原因' = $switchWaitReason
   '4500协议' = if (-not $appServer) { '未检查' } elseif ($protocolError) { "检查失败：$protocolError" } elseif ($protocol.ok) { "正常（initialize + thread/list，任务数 $($protocol.threadCount)，$($protocol.durationMs)ms）" } else { "异常：$($protocol.error)" }
   手机网关 = if ($gateway) { "正常，PID $($gateway.OwningProcess)" } else { "未运行" }
   配置重载 = if ($currentReadError) { "无法确认（配置正在写入或解析失败）" } elseif ($pendingRecord -and $changeKinds) { "待处理（provider=$($changeKinds.provider), credentials=$($changeKinds.credentials), catalogs=$($changeKinds.catalogs), instructions=$($changeKinds.instructions), hooks=$($changeKinds.hooks), deployment=$($changeKinds.deployment)）" } elseif ($effectiveChangeKinds -and ($effectiveChangeKinds.provider -or $effectiveChangeKinds.credentials -or $effectiveChangeKinds.catalogs -or $effectiveChangeKinds.instructions -or $effectiveChangeKinds.hooks -or $effectiveChangeKinds.deployment)) { "磁盘配置已变化，待看门登记（provider=$($effectiveChangeKinds.provider), credentials=$($effectiveChangeKinds.credentials), catalogs=$($effectiveChangeKinds.catalogs), instructions=$($effectiveChangeKinds.instructions), hooks=$($effectiveChangeKinds.hooks), deployment=$($effectiveChangeKinds.deployment)）" } elseif ($pendingRecord) { "待处理（等待看门刷新变化分类）" } elseif (Test-Path -LiteralPath $pendingReload -PathType Leaf) { "待处理（标记无法解析）" } else { "已应用" }

@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'resolve-codex-binary.ps1')
+. (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
 $resolvedRuntime = [System.IO.Path]::GetFullPath($RuntimeDir)
 $logPath = Join-Path $resolvedRuntime 'cutover.log'
 $url = [Uri]$ListenUrl
@@ -56,9 +56,8 @@ if ($Confirmation -ne 'SWITCH_SHARED_APP_SERVER') {
 try {
   Write-CutoverLog "开始预存共享 app-server 版本，当前程序 $($currentOwner.ExecutablePath)，目标快照 $snapshotBinary。"
   $snapshotBinary = Copy-CodexBundleSnapshot -SourceBinary $sourceBinary -RuntimeDir $resolvedRuntime
-  $preferencePath = Set-PreferredCodexBundle -RuntimeDir $resolvedRuntime -SourceBinary $sourceBinary -SnapshotBinary $snapshotBinary
-  Write-CutoverLog "已将共享 app-server 首选 bundle 设为 $snapshotBinary；记录 $preferencePath。"
   if ($currentOwner -and $currentOwner.ExecutablePath -ieq $snapshotBinary -and (Test-CodexBundle -BinaryPath $currentOwner.ExecutablePath)) {
+    $preferencePath = Set-PreferredCodexBundle -RuntimeDir $resolvedRuntime -SourceBinary $sourceBinary -SnapshotBinary $snapshotBinary
     Write-CutoverLog "共享 app-server 已从稳定快照运行，PID $($currentOwner.ProcessId)。"
     Write-Output "shared app-server already uses stable snapshot: PID $($currentOwner.ProcessId)"
     return
@@ -66,15 +65,20 @@ try {
 
   if ($currentOwner) {
     $pendingPath = Join-Path $resolvedRuntime 'pending-app-server-switch.json'
+    $metadata = Get-CodexBundleMetadata -BinaryPath $sourceBinary
     $pending = [ordered]@{
+      reason = 'manual-binary-switch'
       currentPid = $currentOwner.ProcessId
       currentBinary = $currentOwner.ExecutablePath
       sourceBinary = $sourceBinary
+      sourceFingerprint = $metadata.sourceFingerprint
       snapshotBinary = $snapshotBinary
-      preferencePath = $preferencePath
+      codexSha256 = (Get-FileHash -LiteralPath $snapshotBinary -Algorithm SHA256).Hash
+      bundleSha256 = Get-CodexBundleContentFingerprint -BinaryPath $snapshotBinary
+      version = Get-CodexBinaryVersion -BinaryPath $sourceBinary
       requestedAt = (Get-Date).ToUniversalTime().ToString('o')
     }
-    $pending | ConvertTo-Json | Set-Content -LiteralPath $pendingPath -Encoding utf8
+    Write-CodexBinaryRecord -Path $pendingPath -Record $pending
     Write-CutoverLog "目标快照已预存；保留当前 PID $($currentOwner.ProcessId)，等待其正常退出后由 watchdog 启动新快照。"
     Write-Output "shared app-server snapshot staged without interrupting PID $($currentOwner.ProcessId)"
     return
@@ -95,6 +99,7 @@ try {
     throw "监听进程未使用稳定快照：$($newOwner.ExecutablePath)"
   }
   Assert-CodexBundle -BinaryPath $newOwner.ExecutablePath
+  Set-PreferredCodexBundle -RuntimeDir $resolvedRuntime -SourceBinary $sourceBinary -SnapshotBinary $snapshotBinary | Out-Null
   Write-CutoverLog "稳定快照切换完成，PID $($newOwner.ProcessId)，程序 $($newOwner.ExecutablePath)。"
   Write-Output "shared app-server switched to stable snapshot: PID $($newOwner.ProcessId)"
 } catch {

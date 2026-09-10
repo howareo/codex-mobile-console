@@ -14,6 +14,7 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "resolve-powershell.ps1")
 . (Join-Path $PSScriptRoot "codex-config-fingerprint.ps1")
 . (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
+. (Join-Path $PSScriptRoot "codex-binary-update.ps1")
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $HostAddress = Resolve-MobileHostAddress $HostAddress
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
@@ -163,6 +164,7 @@ $lastHeartbeatAt = Get-Date
 $failureCount = 0
 $reloadQuietCount = 0
 $lastPendingFingerprint = $null
+$lastBinaryStatus = $null
 
 try {
   Write-WatchLog "手机控制台看门已启动，检查间隔 ${IntervalSeconds} 秒。"
@@ -196,7 +198,20 @@ try {
       if ($appServerHealthy) {
         $appListener = Get-Listener -Port $appServerUri.Port
         $appOwner = if ($appListener) { Get-CimInstance Win32_Process -Filter "ProcessId=$($appListener.OwningProcess)" -ErrorAction SilentlyContinue } else { $null }
-        if ($appOwner) { Sync-AppServerState $appOwner }
+        if ($appOwner) {
+          Sync-AppServerState $appOwner
+          $installedBinary = Resolve-InstalledCodexBinary
+          $binaryUpdate = Register-CodexBinaryUpdate -RuntimeDir $RuntimeDir -InstalledBinary $installedBinary -RunningBinary ([string]$appOwner.ExecutablePath) -RunningPid ([int]$appOwner.ProcessId)
+          $binaryStatus = "$($binaryUpdate.status):$($binaryUpdate.record.sourceFingerprint)"
+          if ($binaryStatus -ne $lastBinaryStatus) {
+            switch ($binaryUpdate.status) {
+              'observing' { Write-WatchLog "发现 Codex 安装程序变化，正在等待完整 bundle 连续稳定：$($binaryUpdate.record.version)，第 $($binaryUpdate.record.stableObservations) 次。" }
+              'changed-during-copy' { Write-WatchLog 'Codex 安装程序在快照期间仍有变化，放弃本次候选并重新观察。' }
+              'staged' { Write-WatchLog "Codex 新版本已验证并预存：$($binaryUpdate.record.version)。当前 PID $($appOwner.ProcessId) 保持运行，等待用户维护窗口重载。" }
+            }
+            $lastBinaryStatus = $binaryStatus
+          }
+        }
       }
       $state = "app-server=" + $(if ($appServerHealthy) { "正常" } else { "缺失" }) + ", gateway=" + $(if ($gatewayHealthy) { "正常" } else { "缺失" })
       if ($state -ne $lastState) {
@@ -221,7 +236,7 @@ try {
         if ($exitCode -ne 0) { throw "启动检查退出码：$exitCode" }
       }
 
-      if (-not $Once -and (Test-Path -LiteralPath $PendingReloadPath -PathType Leaf) -and $appServerHealthy) {
+      if (-not $Once -and (Test-Path -LiteralPath $PendingReloadPath -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pending-app-server-switch.json') -PathType Leaf) -and $appServerHealthy) {
         $pending = Read-CodexConfigFingerprintRecord $PendingReloadPath
         if ($pending -and $pending.fingerprint -eq $configRecord.fingerprint) {
           if ($lastPendingFingerprint -ne $pending.fingerprint) {

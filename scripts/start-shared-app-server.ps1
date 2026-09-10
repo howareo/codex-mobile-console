@@ -32,6 +32,4 @@ Start-Sleep -Milliseconds 300
 if ($process.HasExited) { throw "shared app-server exited during startup; see $stderr" }
 $record = [ordered]@{ pid = $process.Id; binary = [System.IO.Path]::GetFullPath($CodexBinary); sourceBinary = [System.IO.Path]::GetFullPath($SourceCodexBinary); listenUrl = $ListenUrl; startedAt = (Get-Date).ToUniversalTime().ToString('o') }
 $record | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $resolvedRuntime 'shared-app-server.json') -Encoding utf8
-$pendingSwitch = Join-Path $resolvedRuntime 'pending-app-server-switch.json'
-if (Test-Path -LiteralPath $pendingSwitch -PathType Leaf) { Remove-Item -LiteralPath $pendingSwitch -Force }
 Write-Output "shared app-server started: PID $($process.Id), $ListenUrl"

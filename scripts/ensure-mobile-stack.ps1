@@ -3,7 +3,8 @@ param(
   [string]$HostAddress = '',
   [int]$GatewayPort = 4174,
   [string]$AppServerUrl = "ws://127.0.0.1:4500",
-  [int]$NetworkWaitSeconds = 180
+  [int]$NetworkWaitSeconds = 180,
+  [switch]$ApplyPendingSwitch
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,6 +12,7 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "resolve-powershell.ps1")
 . (Join-Path $PSScriptRoot "codex-config-fingerprint.ps1")
 . (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
+. (Join-Path $PSScriptRoot "codex-binary-update.ps1")
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $HostAddress = Resolve-MobileHostAddress $HostAddress
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
@@ -114,17 +116,20 @@ try {
       try { $preferredBinary = Resolve-PreferredCodexBinary -RuntimeDir $RuntimeDir }
       catch { Write-AutostartLog "首选 Codex 快照失效，将重新发现当前完整运行时：$($_.Exception.Message)" }
     }
-    $desktopBinary = Resolve-CodexDesktopBinary
-    $managedRuntimePath = try { Resolve-CodexBinary } catch { $null }
-    $runtimeBinary = if ($managedRuntimePath) { [pscustomobject]@{ Path = [string]$managedRuntimePath } } else { $desktopBinary }
-    $desktopChanged = $false
-    if ($runtimeBinary -and $preferredRecord -and $preferredRecord.sourceBinary -and ([string]$preferredRecord.sourceBinary -match '\\WindowsApps\\OpenAI\.Codex_') -and -not [string]::Equals([System.IO.Path]::GetFullPath([string]$preferredRecord.sourceBinary), [System.IO.Path]::GetFullPath([string]$runtimeBinary.Path), [StringComparison]::OrdinalIgnoreCase)) {
-      $desktopChanged = $true
-      $preferredBinary = $null
-      Write-AutostartLog "检测到 Codex Desktop/primary runtime 已更新，首选运行时将从当前完整 bundle 重新生成。"
+    $installedBinary = try { Resolve-InstalledCodexBinary } catch { $null }
+    if ($installedBinary) {
+      $comparisonBinary = if ($preferredBinary) { $preferredBinary } elseif ($stateBinary) { $stateBinary } else { $null }
+      $binaryUpdate = Register-CodexBinaryUpdate -RuntimeDir $RuntimeDir -InstalledBinary $installedBinary -RunningBinary $comparisonBinary
+      if ($binaryUpdate.status -eq 'observing') { Write-AutostartLog "Codex 安装候选正在稳定观察：$($binaryUpdate.record.version)，第 $($binaryUpdate.record.stableObservations) 次。" }
+      elseif ($binaryUpdate.status -eq 'staged') { Write-AutostartLog "Codex 安装候选已验证并预存：$($binaryUpdate.record.version)。" }
     }
-    $codexBinary = if ($preferredBinary -and -not $desktopChanged) { $preferredBinary } elseif ($runtimeBinary) { [string]$runtimeBinary.Path } else { Resolve-CodexBinary -FallbackPath $stateBinary }
-    Write-AutostartLog "将使用$(if ($preferredBinary -and -not $desktopChanged) { '首选快照' } elseif ($runtimeBinary) { '当前 Desktop primary runtime' } else { '动态发现' })的 Codex 程序：$codexBinary。"
+    $pendingSwitchPath = Join-Path $RuntimeDir 'pending-app-server-switch.json'
+    $pendingSwitch = Read-CodexBinaryRecord -Path $pendingSwitchPath
+    $pendingBinary = if ($ApplyPendingSwitch -and $pendingSwitch -and (Test-CodexPendingBinarySwitch -Record $pendingSwitch -Full)) { [string]$pendingSwitch.snapshotBinary } else { $null }
+    if ($pendingSwitch -and -not $ApplyPendingSwitch) { Write-AutostartLog 'Codex 新版本已预存，普通故障自愈继续使用上一个首选快照，等待用户维护窗口。' }
+    elseif ($pendingSwitch -and -not $pendingBinary) { Write-AutostartLog '待切换 Codex bundle 无效，保留标记供诊断并使用上一个首选快照。' }
+    $codexBinary = if ($pendingBinary) { $pendingBinary } elseif ($preferredBinary) { $preferredBinary } elseif ($installedBinary) { $installedBinary } else { Resolve-CodexBinary -FallbackPath $stateBinary }
+    Write-AutostartLog "将使用$(if ($pendingBinary) { '待切换快照' } elseif ($preferredBinary) { '首选快照' } elseif ($installedBinary) { '当前安装运行时' } else { '动态发现' })的 Codex 程序：$codexBinary。"
     & (Join-Path $PSScriptRoot "start-shared-app-server.ps1") -Apply -Confirmation START_SHARED_APP_SERVER -ListenUrl $AppServerUrl -CodexBinary $codexBinary -RuntimeDir $RuntimeDir | ForEach-Object { Write-AutostartLog $_ }
     $deadline = (Get-Date).AddSeconds(20)
     $appReady = $false
@@ -135,19 +140,18 @@ try {
     } while ((-not $appListener -or -not $appReady) -and (Get-Date) -lt $deadline)
     if (-not $appListener -or -not $appReady) { throw "共享 app-server 未在 20 秒内通过 readyz。" }
     $startedOwner = Get-CimInstance Win32_Process -Filter "ProcessId=$($appListener.OwningProcess)"
-    if ($runtimeBinary -and ($desktopChanged -or -not $preferredBinary)) {
-      $snapshotBinary = [System.IO.Path]::GetFullPath([string]$startedOwner.ExecutablePath)
-      Set-PreferredCodexBundle -RuntimeDir $RuntimeDir -SourceBinary ([string]$runtimeBinary.Path) -SnapshotBinary $snapshotBinary | Out-Null
+    $snapshotBinary = [System.IO.Path]::GetFullPath([string]$startedOwner.ExecutablePath)
+    if ($pendingBinary -and [string]::Equals($snapshotBinary, [System.IO.Path]::GetFullPath($pendingBinary), [StringComparison]::OrdinalIgnoreCase)) {
+      $actualHash = (Get-FileHash -LiteralPath $snapshotBinary -Algorithm SHA256).Hash
+      if ($pendingSwitch.codexSha256 -and $actualHash -ne [string]$pendingSwitch.codexSha256) { throw '新 app-server 已启动，但程序哈希与待切换记录不一致。' }
+      if ($pendingSwitch.bundleSha256 -and (Get-CodexBundleContentFingerprint -BinaryPath $snapshotBinary) -ne [string]$pendingSwitch.bundleSha256) { throw '新 app-server 已启动，但完整 bundle 哈希与待切换记录不一致。' }
+      Set-PreferredCodexBundle -RuntimeDir $RuntimeDir -SourceBinary ([string]$pendingSwitch.sourceBinary) -SnapshotBinary $snapshotBinary | Out-Null
+      Remove-Item -LiteralPath $pendingSwitchPath -Force
+      Write-AutostartLog "Codex 版本切换已生效：$($pendingSwitch.version)，待切换标记已清除。"
+    } elseif (-not $preferredBinary -and $installedBinary) {
+      Set-PreferredCodexBundle -RuntimeDir $RuntimeDir -SourceBinary $installedBinary -SnapshotBinary $snapshotBinary | Out-Null
     }
     Write-AppServerState $startedOwner
-    $pendingSwitchPath = Join-Path $RuntimeDir 'pending-app-server-switch.json'
-    if (Test-Path -LiteralPath $pendingSwitchPath -PathType Leaf) {
-      $pendingSwitch = Get-Content -LiteralPath $pendingSwitchPath -Raw -Encoding utf8 | ConvertFrom-Json
-      if ([string]::Equals([System.IO.Path]::GetFullPath([string]$startedOwner.ExecutablePath), [System.IO.Path]::GetFullPath([string]$pendingSwitch.snapshotBinary), [StringComparison]::OrdinalIgnoreCase)) {
-        Remove-Item -LiteralPath $pendingSwitchPath -Force
-        Write-AutostartLog "首选 app-server bundle 已生效，待切换标记已清除。"
-      }
-    }
     Write-CodexConfigFingerprintRecord $ConfigStatePath $startedWithConfigRecord
     $currentConfigRecord = Get-CodexConfigFingerprintRecord
     if ($currentConfigRecord.fingerprint -eq $startedWithConfigRecord.fingerprint) {

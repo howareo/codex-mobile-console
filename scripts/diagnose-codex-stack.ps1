@@ -9,6 +9,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'resolve-codex-binary.ps1')
 . (Join-Path $PSScriptRoot 'codex-config-fingerprint.ps1')
 . (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
+. (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $RuntimeDir = Join-Path $ProjectRoot '.runtime'
 $GatewayHost = Resolve-MobileHostAddress ''
@@ -61,6 +62,10 @@ $gatewayListener = Get-Listener 4174
 $desktop = @(Get-AppxPackage -Name 'OpenAI.Codex' -ErrorAction SilentlyContinue | Select-Object -First 1 Name,Version,InstallLocation)
 $preferredPath = Join-Path $RuntimeDir 'preferred-app-server-bundle.json'
 $preferred = if (Test-Path -LiteralPath $preferredPath -PathType Leaf) { try { Get-Content -LiteralPath $preferredPath -Raw -Encoding utf8 | ConvertFrom-Json } catch { $null } } else { $null }
+$installedBinary = try { Resolve-InstalledCodexBinary } catch { $null }
+$installedVersion = if ($installedBinary) { Get-CodexBinaryVersion -BinaryPath $installedBinary } else { $null }
+$pendingSwitchPath = Join-Path $RuntimeDir 'pending-app-server-switch.json'
+$pendingSwitch = Read-CodexBinaryRecord -Path $pendingSwitchPath
 $config = $null
 $configError = $null
 try { $config = Get-CodexConfigFingerprintRecord } catch { $configError = $_.Exception.Message }
@@ -80,7 +85,9 @@ $report = [ordered]@{
   appServer = [ordered]@{ listening = [bool]$appListener; pid = if ($appListener) { [int]$appListener.OwningProcess } else { $null }; binary = if ($appOwner) { $appOwner.ExecutablePath } else { $null }; version = $appVersion; healthz = Get-Health 4500 '/healthz'; readyz = Get-Health 4500 '/readyz'; protocol = $protocol }
   gateway = [ordered]@{ listening = [bool]$gatewayListener; pid = if ($gatewayListener) { [int]$gatewayListener.OwningProcess } else { $null }; health = Get-GatewayHealth $GatewayHost 4174 }
   desktop = $desktop
+  installedRuntime = [ordered]@{ binary = $installedBinary; version = $installedVersion; completeBundle = [bool]($installedBinary -and (Test-CodexBundle -BinaryPath $installedBinary)) }
   preferredBundle = if ($preferred) { [ordered]@{ sourceBinary = $preferred.sourceBinary; snapshotBinary = $preferred.snapshotBinary; codexSha256 = $preferred.codexSha256 } } else { $null }
+  pendingVersionSwitch = if ($pendingSwitch) { [ordered]@{ version = $pendingSwitch.version; sourceBinary = $pendingSwitch.sourceBinary; snapshotBinary = $pendingSwitch.snapshotBinary; requestedAt = $pendingSwitch.requestedAt; valid = Test-CodexPendingBinarySwitch -Record $pendingSwitch } } else { $null }
   config = [ordered]@{ readable = [bool]$config; error = $configError; fingerprint = if ($config) { $config.fingerprint } else { $null }; appliedFingerprint = if ($applied) { $applied.fingerprint } else { $null }; pendingFingerprint = if ($pending) { $pending.fingerprint } else { $null }; components = if ($config) { $config.components } else { $null } }
   logPatterns = $patterns
 }

@@ -179,7 +179,22 @@ npm run build
 .\scripts\codex-mobile.ps1 restart-gateway -Apply -Confirmation RESTART_MOBILE_GATEWAY
 ```
 
-Codex Desktop 升级导致旧运行时路径变化时，看门会自动发现新 bundle、生成快照，并在 4500 下次退出或维护重载时使用它。
+Codex Desktop/primary runtime 升级后，看门会独立检测安装目录中的完整 bundle。候选必须连续两次保持相同，随后才会复制到 `.runtime\codex-bundles` 并登记“版本切换待处理”。此过程不会停止健康的 4500，也不会把未验证候选直接覆盖为首选版本。
+
+```powershell
+.\scripts\codex-mobile.ps1 status
+```
+
+状态会分别显示“已安装版本”“4500 实际版本”“版本切换目标”和“版本等待原因”。两者不一致时，以 4500 监听 PID 的 `ExecutablePath` 及该文件的 `--version` 为准；PATH 中的 `codex --version` 只代表磁盘安装版本。
+
+版本候选完成预存后，关闭 Codex Desktop 和手机页面，执行维护窗口重载：
+
+```powershell
+.\scripts\codex-mobile.ps1 restart-4500
+.\scripts\codex-mobile.ps1 restart-4500 -Apply -Confirmation RELOAD_SHARED_APP_SERVER
+```
+
+预览会列出阻塞连接和目标版本。正式重载会明确授权启动待切换快照，核对新 PID、实际路径、完整 bundle 哈希、`--version`、`readyz`、`initialize + thread/list` 与配置指纹；启动或验证失败时会恢复上一个已验证快照，并保留待处理标记供诊断。快速连续升级只会在最新候选连续稳定后更新目标；若 4500 在维护前意外退出，看门仍恢复旧首选快照，不会借故障自愈偷偷切换版本。
 
 如果 `status` 显示“配置待处理”，先关闭 Codex Desktop 和手机页面，执行 `reload` 预览；确认没有连接后再使用带 `-Apply` 的重载命令。更新过程不编辑 `state_5.sqlite`，也不会替换 API key。
 
