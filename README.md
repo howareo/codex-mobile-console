@@ -187,7 +187,7 @@ Codex Desktop/primary runtime 升级后，看门会独立检测安装目录中�
 
 状态会分别显示“已安装版本”“4500 实际版本”“版本切换目标”和“版本等待原因”。两者不一致时，以 4500 监听 PID 的 `ExecutablePath` 及该文件的 `--version` 为准；PATH 中的 `codex --version` 只代表磁盘安装版本。
 
-版本候选完成预存后，关闭 Codex Desktop 和手机页面，执行维护窗口重载：
+版本候选完成预存后，关闭 Codex Desktop 和手机页面。看门确认连续两个周期没有客户端连接、所有已加载任务均为空闲后，会自动重载。状态未知、协议查询失败或仍有任务运行时继续等待。同一目标自动重载失败后暂停重试，保留诊断记录；也可手动执行维护窗口重载：
 
 ```powershell
 .\scripts\codex-mobile.ps1 restart-4500

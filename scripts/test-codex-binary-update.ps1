@@ -54,8 +54,9 @@ try {
   Write-Output 'PASS: incomplete or missing pending bundles are rejected'
 
   $watchSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'watch-mobile-stack.ps1') -Raw
-  if ($watchSource -match 'PendingSwitch.*Invoke-Reload|pending-app-server-switch.*Invoke-Reload') { throw '看门包含版本 pending 的自动重启链路。' }
-  if ($watchSource -notmatch "PendingReloadPath.*-not \(Test-Path.*pending-app-server-switch\.json") { throw '版本待切换期间没有暂停配置自动重载。' }
+  foreach ($guard in @('Test-AppServerIdle $AppServerUrl', '$reloadQuietCount -ge $ReloadQuietChecks', 'failed-auto-reload.json', '$versionPending')) {
+    if (-not $watchSource.Contains($guard)) { throw "Missing automatic reload guard: $guard" }
+  }
   $reloadSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'request-app-server-reload.ps1') -Raw
   foreach ($required in @('Get-ReloadBlockers', 'pending-app-server-switch.json', 'Get-CodexBinaryVersion', 'Assert-AppServerProtocol', '待处理标记已保留')) {
     if (-not $reloadSource.Contains($required)) { throw "维护重载缺少保护：$required" }
@@ -72,7 +73,7 @@ try {
   if (-not $reloadSource.Contains('Write-CodexBinaryRecord -Path $switchPath -Record $pendingSwitch')) { throw '重载失败时没有恢复版本 pending。' }
   $switchSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'switch-shared-app-server.ps1') -Raw
   if ($switchSource.IndexOf('Set-PreferredCodexBundle', [StringComparison]::Ordinal) -lt $switchSource.IndexOf("if (`$currentOwner", [StringComparison]::Ordinal)) { throw '旧切换入口仍在验证前覆盖首选快照。' }
-  Write-Output 'PASS: version switching stays maintenance-only and status exposes installed/running/target/wait reason'
+  Write-Output 'PASS: automatic switching requires quiet clients and idle tasks; failed target retries are blocked'
 } finally {
   $resolvedFixture = [System.IO.Path]::GetFullPath($fixtureRoot)
   $resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())

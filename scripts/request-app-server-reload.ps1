@@ -15,6 +15,7 @@ $PSNativeCommandUseErrorActionPreference = $false
 $HostAddress = Resolve-MobileHostAddress $HostAddress
 . (Join-Path $PSScriptRoot 'codex-config-fingerprint.ps1')
 . (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
+. (Join-Path $PSScriptRoot 'test-app-server-idle.ps1')
 $resolvedRuntime = [System.IO.Path]::GetFullPath($RuntimeDir)
 $url = [Uri]$ListenUrl
 if ($url.Scheme -ne 'ws' -or $url.Host -notin @('127.0.0.1', 'localhost', '::1')) {
@@ -108,6 +109,9 @@ $oldPid = [int]$owner.ProcessId
 $oldBinary = [System.IO.Path]::GetFullPath([string]$owner.ExecutablePath)
 $preferredPath = Join-Path $resolvedRuntime 'preferred-app-server-bundle.json'
 $oldPreferred = Read-CodexBinaryRecord -Path $preferredPath
+if ($Reason -eq 'watchdog-maintenance') {
+  if (-not (Test-AppServerIdle $ListenUrl) -or @(Get-ReloadBlockers).Count -gt 0) { throw '自动重载暂停：任务非空闲或客户端重新连接。' }
+}
 try {
   Stop-Process -Id $oldPid -Force -ErrorAction Stop
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -142,6 +146,8 @@ try {
   if ($pendingSwitch) { Write-Output "已切换版本：$(Get-CodexBinaryVersion -BinaryPath $newOwner.ExecutablePath)" }
   Write-Output "协议加载验证：initialize + thread/list 通过，任务数 $($protocol.threadCount)。"
   Write-Output "已应用指纹：$($applied.fingerprint)"
+  $failurePath = Join-Path $resolvedRuntime 'failed-auto-reload.json'
+  if (Test-Path -LiteralPath $failurePath) { Remove-Item -LiteralPath $failurePath }
 } catch {
   $failure = $_.Exception.Message
   try { Write-CodexConfigReloadMarker $markerPath (Get-CodexConfigFingerprintRecord) 'reload-failed' | Out-Null } catch { }

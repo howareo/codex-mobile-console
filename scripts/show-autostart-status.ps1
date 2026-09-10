@@ -13,6 +13,7 @@ $installedVersion = if ($installedBinary) { Get-CodexBinaryVersion -BinaryPath $
 $pendingSwitchPath = Join-Path $PSScriptRoot '..\.runtime\pending-app-server-switch.json'
 $pendingSwitchExists = Test-Path -LiteralPath $pendingSwitchPath -PathType Leaf
 $pendingSwitch = Read-CodexBinaryRecord -Path $pendingSwitchPath
+$autoFailure = Read-CodexBinaryRecord (Join-Path $PSScriptRoot '../.runtime/failed-auto-reload.json')
 $protocol = $null
 $protocolError = $null
 if ($appServer) {
@@ -85,6 +86,7 @@ $overall = if (-not $appServer) {
   '已安装版本' = if ($installedVersion) { "$installedVersion（$installedBinary）" } else { '未发现完整安装 bundle' }
   '版本切换' = if ($pendingSwitch) { "待处理：$($pendingSwitch.version) -> $($pendingSwitch.snapshotBinary)" } elseif ($pendingSwitchExists) { '待处理标记无法解析' } elseif ($binaryDrift) { '磁盘安装版本与 4500 不同，等待看门连续确认并登记' } else { '已一致' }
   '版本等待原因' = $switchWaitReason
+  '自动切换策略' = if ($autoFailure) { '存在自动重载失败记录；同一目标暂停重试，请诊断后手动重载' } else { '连接清空且任务空闲连续两轮后自动切换；任务状态未知则等待' }
   '4500协议' = if (-not $appServer) { '未检查' } elseif ($protocolError) { "检查失败：$protocolError" } elseif ($protocol.ok) { "正常（initialize + thread/list，任务数 $($protocol.threadCount)，$($protocol.durationMs)ms）" } else { "异常：$($protocol.error)" }
   手机网关 = if ($gateway) { "正常，PID $($gateway.OwningProcess)" } else { "未运行" }
   配置重载 = if ($currentReadError) { "无法确认（配置正在写入或解析失败）" } elseif ($pendingRecord -and $changeKinds) { "待处理（provider=$($changeKinds.provider), credentials=$($changeKinds.credentials), catalogs=$($changeKinds.catalogs), instructions=$($changeKinds.instructions), hooks=$($changeKinds.hooks), deployment=$($changeKinds.deployment)）" } elseif ($effectiveChangeKinds -and ($effectiveChangeKinds.provider -or $effectiveChangeKinds.credentials -or $effectiveChangeKinds.catalogs -or $effectiveChangeKinds.instructions -or $effectiveChangeKinds.hooks -or $effectiveChangeKinds.deployment)) { "磁盘配置已变化，待看门登记（provider=$($effectiveChangeKinds.provider), credentials=$($effectiveChangeKinds.credentials), catalogs=$($effectiveChangeKinds.catalogs), instructions=$($effectiveChangeKinds.instructions), hooks=$($effectiveChangeKinds.hooks), deployment=$($effectiveChangeKinds.deployment)）" } elseif ($pendingRecord) { "待处理（等待看门刷新变化分类）" } elseif (Test-Path -LiteralPath $pendingReload -PathType Leaf) { "待处理（标记无法解析）" } else { "已应用" }

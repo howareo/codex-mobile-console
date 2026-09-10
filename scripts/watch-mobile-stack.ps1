@@ -15,6 +15,7 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "codex-config-fingerprint.ps1")
 . (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
 . (Join-Path $PSScriptRoot "codex-binary-update.ps1")
+. (Join-Path $PSScriptRoot 'test-app-server-idle.ps1')
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $HostAddress = Resolve-MobileHostAddress $HostAddress
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
@@ -236,15 +237,20 @@ try {
         if ($exitCode -ne 0) { throw "启动检查退出码：$exitCode" }
       }
 
-      if (-not $Once -and (Test-Path -LiteralPath $PendingReloadPath -PathType Leaf) -and -not (Test-Path -LiteralPath (Join-Path $RuntimeDir 'pending-app-server-switch.json') -PathType Leaf) -and $appServerHealthy) {
+      $versionPending = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'pending-app-server-switch.json')
+      if (-not $Once -and ((Test-Path -LiteralPath $PendingReloadPath -PathType Leaf) -or $versionPending) -and $appServerHealthy) {
         $pending = Read-CodexConfigFingerprintRecord $PendingReloadPath
-        if ($pending -and $pending.fingerprint -eq $configRecord.fingerprint) {
-          if ($lastPendingFingerprint -ne $pending.fingerprint) {
-            $lastPendingFingerprint = $pending.fingerprint
+        $reloadKey = "$($configRecord.fingerprint):$($versionPending.codexSha256)"
+        $failed = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'failed-auto-reload.json')
+        $candidate = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'installed-app-server-candidate.json')
+        $versionStable = -not $versionPending -or ($candidate.status -eq 'pending' -and $candidate.sourceFingerprint -eq $versionPending.sourceFingerprint)
+        if ($versionStable -and (-not $pending -or $pending.fingerprint -eq $configRecord.fingerprint) -and (-not $failed -or $failed.key -ne $reloadKey)) {
+          if ($lastPendingFingerprint -ne $reloadKey) {
+            $lastPendingFingerprint = $reloadKey
             $reloadQuietCount = 0
           }
           $blockers = @(Get-ReloadBlockers ([Uri]$AppServerUrl) $GatewayPort)
-          if ($blockers.Count -eq 0) {
+          if ($blockers.Count -eq 0 -and (Test-AppServerIdle $AppServerUrl)) {
             $reloadQuietCount++
             if ($reloadQuietCount -ge $ReloadQuietChecks) {
               Write-WatchLog "配置指纹 $($pending.fingerprint) 已稳定且连续 $reloadQuietCount 个检查周期无客户端连接，开始受控自动重载。"
@@ -252,10 +258,14 @@ try {
                 "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                 "-File", $ReloadScript,
                 "-Apply", "-Confirmation", "RELOAD_SHARED_APP_SERVER",
-                "-Reason", "watchdog-maintenance"
+                "-Reason", "watchdog-maintenance",
+                "-HostAddress", $HostAddress, "-GatewayPort", [string]$GatewayPort, "-ListenUrl", $AppServerUrl
               )
               $reloadExit = Invoke-ReloadWithTimeout -Arguments $reloadArguments -TimeoutSeconds $EnsureTimeoutSeconds
-              if ($reloadExit -ne 0) { throw "配置自动重载退出码：$reloadExit" }
+              if ($reloadExit -ne 0) {
+                Write-CodexBinaryRecord (Join-Path $RuntimeDir 'failed-auto-reload.json') @{ key = $reloadKey; exitCode = $reloadExit }
+                throw "自动重载失败，暂停同一目标的自动重试：$reloadExit"
+              }
               $reloadQuietCount = 0
               $lastPendingFingerprint = $null
             }
