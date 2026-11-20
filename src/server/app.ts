@@ -1,5 +1,7 @@
 import { registerClaudeProxy } from "./claude-proxy.js";
 import { createClaudeVersionReporter, type ClaudeVersions } from "./claude-versions.js";
+import { contextUsageFromRpc, readRolloutContextUsage } from "./context-usage.js";
+import type { ThreadContextUsage } from "../shared/types.js";
 import { registerToolDetails, toolDetailsUrl } from "./tool-details.js";
 import { existsSync, readFileSync } from "node:fs";
 import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
@@ -12,6 +14,8 @@ import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
 import { AppServerClient, type AppServerFrame, type AppServerRequestPriority } from "../protocol/app-server-client.js";
 import type { ApprovalRequest, JsonObject, LoadedTasksDiagnosticsResult, ModelListResult, RpcId, RpcNotification, ThreadMetadataResult, ThreadPageResult, ThreadSummary, TurnInput } from "../shared/types.js";
+import { formatMobileAttachments, MAX_ATTACHMENTS_PER_TURN } from "../shared/attachments.js";
+import { readAttachment, registerAttachments, turnAttachmentIds } from "./attachments.js";
 import { normalizeThreadCwd } from "../shared/cwd.js";
 import type { GatewayConfig } from "./config.js";
 import { GatewayLogger, RollingGatewayMetrics, type LogLevel } from "./diagnostics.js";
@@ -69,6 +73,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   const activeThreadWrites = new Map<string, string>();
   const writeReceipts = new Map<string, WriteReceipt>();
   const subscribedThreads = new Set<string>();
+  const liveContextUsage = new Map<string, ThreadContextUsage>();
   const unsubscribeFailures = new Map<string, { attempts: number; lastErrorAt: string }>();
   const mobileResumedThreads = subscribedThreads;
   const threadLifecycle = new Map<string, Promise<void>>();
@@ -355,6 +360,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
         // A failed or timed-out unsubscribe has an unknown upstream state.
         // Force the next write to resume rather than trusting stale local data.
         subscribedThreads.delete(threadId);
+        liveContextUsage.delete(threadId);
       }
     }).catch(error => {
       unsubscribeFailures.set(threadId, { attempts: UNSUBSCRIBE_RETRY_ATTEMPTS, lastErrorAt: new Date().toISOString() });
@@ -598,6 +604,8 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     return { ok: true };
   });
 
+  await registerAttachments(app, config.uploadRoot, requireSession, logger);
+
   app.post<{ Body: Buffer }>("/api/images", { onRequest: requireSession, bodyLimit: MAX_IMAGE_UPLOAD_BYTES }, async (request, reply) => {
     if (!config.imageUploadRoot) return reply.code(503).send({ error: "image uploads are not configured" });
     const body = request.body;
@@ -658,15 +666,20 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     return { thread };
   });
 
-  // Detail history stays turns-only. Session parameters are fetched only when
-  // the mobile user explicitly opens the composer settings for this task.
+  // Detail history stays turns-only. Metadata supplies session settings and context usage.
   app.get<{ Params: { threadId: string } }>("/api/threads/:threadId/metadata", { preHandler: requireSession }, async (request): Promise<ThreadMetadataResult> => {
     const metadata = await upstream.readThreadMetadata(request.params.threadId, "foreground");
+    const threadId = request.params.threadId;
+    const persistedUsage = !liveContextUsage.has(threadId) && metadata.thread.id === threadId
+      ? await readRolloutContextUsage(upstream.initializeResult?.codexHome, metadata.thread.path, threadId)
+      : null;
+    const contextUsage = liveContextUsage.get(threadId) ?? persistedUsage;
     return {
       id: request.params.threadId,
       model: metadata.model ?? metadata.thread.model ?? null,
       modelProvider: metadata.modelProvider ?? metadata.thread.modelProvider ?? null,
-      reasoningEffort: metadata.reasoningEffort ?? metadata.thread.reasoningEffort ?? null
+      reasoningEffort: metadata.reasoningEffort ?? metadata.thread.reasoningEffort ?? null,
+      ...(contextUsage ? { contextUsage } : {})
     };
   });
 
@@ -676,11 +689,13 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   registerToolDetails(app, requireSession, upstream);
 
-  app.post<{ Params: { threadId: string }; Body: { text?: string; images?: unknown; activeTurnId?: string; requestId?: string; model?: string | null; reasoningEffort?: string | null } }>("/api/threads/:threadId/turns", { preHandler: requireSession }, async (request, reply) => {
+  app.post<{ Params: { threadId: string }; Body: { text?: string; images?: unknown; attachments?: unknown; activeTurnId?: string; requestId?: string; model?: string | null; reasoningEffort?: string | null } }>("/api/threads/:threadId/turns", { preHandler: requireSession }, async (request, reply) => {
     const text = typeof request.body?.text === "string" ? request.body.text.trim() : "";
     const imageIds = turnImageIds(request.body?.images);
     if (imageIds === null) return reply.code(400).send({ error: `images must contain at most ${MAX_IMAGES_PER_TURN} uploaded image ids` });
-    if (!text && imageIds.length === 0) return reply.code(400).send({ error: "message text or image is required" });
+    const attachmentIds = turnAttachmentIds(request.body?.attachments);
+    if (attachmentIds === null) return reply.code(400).send({ error: `attachments must contain at most ${MAX_ATTACHMENTS_PER_TURN} uploaded attachment ids` });
+    if (!text && imageIds.length === 0 && attachmentIds.length === 0) return reply.code(400).send({ error: "message text, image, or attachment is required" });
     if (imageIds.length > 0 && !config.imageUploadRoot) return reply.code(503).send({ error: "image uploads are not configured" });
     const imagePaths: string[] = [];
     for (const imageId of imageIds) {
@@ -693,11 +708,17 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
       }
       imagePaths.push(path);
     }
+    const uploadRoot = config.uploadRoot;
+    if (attachmentIds.length > 0 && !uploadRoot) return reply.code(503).send({ error: "attachment uploads are not configured" });
+    const attachments = uploadRoot ? await Promise.all(attachmentIds.map(id => readAttachment(uploadRoot, id))) : [];
+    if (!attachments.every(attachment => attachment !== null)) return reply.code(400).send({ error: "uploaded attachment not found" });
     const turnInput: TurnInput[] = [
       ...(text ? [{ type: "text" as const, text }] : []),
+      // Keep the manifest separate so history can compact long user text without losing attachments.
+      ...(attachments.length > 0 ? [{ type: "text" as const, text: formatMobileAttachments(attachments) }] : []),
       ...imagePaths.map(path => ({ type: "localImage" as const, path, detail: "auto" as const }))
     ];
-    const upstreamInput: string | TurnInput[] = imagePaths.length > 0 ? turnInput : text;
+    const upstreamInput: string | TurnInput[] = imagePaths.length > 0 || attachments.length > 0 ? turnInput : text;
     const requestId = mobileRequestId(request.body?.requestId);
     if (!requestId) return reply.code(400).send({ error: "invalid request id" });
     const receiptKey = `${request.params.threadId}:${requestId}`;
@@ -774,6 +795,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
         recovered = true;
         logger.warn("write.resume_after_thread_not_found", { requestId, threadId: request.params.threadId });
         subscribedThreads.delete(request.params.threadId);
+        liveContextUsage.delete(request.params.threadId);
         await ensureThreadSubscription(request.params.threadId);
         result = await upstream.startTurn(request.params.threadId, upstreamInput, startSettings);
       }
@@ -952,8 +974,16 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   upstream.on("notification", (message: unknown) => {
     const notification = notificationValue(message);
-    if (notification && (notification.method.startsWith("thread/") || notification.method.startsWith("turn/"))) threadListCache = null;
     const targetThreadId = notification ? notificationThreadId(notification) : null;
+    if (notification?.method === "thread/tokenUsage/updated") {
+      if (!targetThreadId) return;
+      const usage = contextUsageFromRpc(objectValue(notification.params)?.tokenUsage);
+      if (!usage) return;
+      if (subscribedThreads.has(targetThreadId)) liveContextUsage.set(targetThreadId, usage);
+      broadcastToThread(sockets, subscriptions, targetThreadId, compactNotification(message, config.pairingSecret), logger);
+      return;
+    }
+    if (notification && (notification.method.startsWith("thread/") || notification.method.startsWith("turn/"))) threadListCache = null;
     if (targetThreadId && hasMobileSubscription(targetThreadId, subscriptions) && (notification?.method.startsWith("thread/") || notification?.method.startsWith("turn/") || notification?.method.startsWith("item/"))) {
       queueSnapshot(targetThreadId);
     }
@@ -1002,6 +1032,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   upstream.on("close", (error: Error) => {
     approvals.clear();
     subscribedThreads.clear();
+    liveContextUsage.clear();
     threadLifecycle.clear();
     releaseInFlight.clear();
     logger.error("upstream.closed", { error });

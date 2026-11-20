@@ -136,7 +136,8 @@ export function mergeThreadMetadata<T extends ThreadSummary>(thread: T, metadata
     ...thread,
     ...(metadata.model !== undefined ? { model: metadata.model } : {}),
     ...(metadata.modelProvider !== undefined ? { modelProvider: metadata.modelProvider } : {}),
-    ...(metadata.reasoningEffort !== undefined ? { reasoningEffort: metadata.reasoningEffort } : {})
+    ...(metadata.reasoningEffort !== undefined ? { reasoningEffort: metadata.reasoningEffort } : {}),
+    ...(metadata.contextUsage !== undefined ? { contextUsage: metadata.contextUsage } : {})
   };
 }
 

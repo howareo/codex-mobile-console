@@ -11,7 +11,6 @@ import {
   Clock3,
   FolderClosed,
   Gauge,
-  ImagePlus,
   LayoutList,
   ListChecks,
   LoaderCircle,
@@ -39,6 +38,8 @@ import { createErrorText, interruptErrorText, sendErrorText, turnErrorText } fro
 import { normalizeThreadCwd, uniqueThreadCwds } from "../../src/shared/cwd";
 import { latestPlanFromTurn, planNotification, planProgress, planSnapshotKey, type PlanSnapshot, type PlanStep } from "./plan-state";
 import { MAX_IMAGES_PER_MESSAGE, prepareImageAttachment, releaseImageAttachment, type DraftImage } from "./image-attachments";
+import { AttachmentPicker, AttachmentDrafts, attachmentsFromDrop, createAttachmentDrafts, uploadAttachment, validateAttachmentDrafts, type DraftAttachment } from "./file-attachments";
+import { ContextUsageIndicator, contextUsageNotification } from "./context-usage";
 import { ClaudeView } from "./claude-view";
 import { ThreadMessages } from "./thread-messages";
 import { THEME_OPTIONS, applyThemeMode, readThemeMode, syncThemeColor, writeThemeMode, type ThemeMode } from "./theme";
@@ -220,8 +221,7 @@ function App() {
   };
 
   // Keep parameter reads isolated from the regular turns-only detail request.
-  // A task is read at most once per signed-in mobile session, even if its
-  // settings panel is opened repeatedly.
+  // Reuse metadata while the chat stays open; reopening or reconnecting refreshes it.
   const loadThreadMetadata = (threadId: string): Promise<void> => {
     if (threadMetadataFetchedRef.current.has(threadId)) return Promise.resolve();
     const existing = threadMetadataRequestsRef.current.get(threadId);
@@ -597,10 +597,10 @@ function App() {
     setReasoningOverrides(current => effort === null ? clearThreadOverride(current, threadId) : { ...current, [threadId]: effort });
   };
 
-  const sendMessage = async (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[] = []): Promise<boolean> => {
+  const sendMessage = async (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[] = [], attachments: DraftAttachment[] = []): Promise<boolean> => {
     const message = text.trim();
-    if (!message && images.length === 0) return false;
-    const payloadKey = `${message}\n${images.map(image => image.id).join(",")}`;
+    if (!message && images.length === 0 && attachments.length === 0) return false;
+    const payloadKey = `${message}\n${images.map(image => image.id).join(",")}\n${attachments.map(file => file.id).join(",")}`;
     const previous = threadActions[threadId];
     const requestId = previous?.kind === "send" && previous.error && previous.message === payloadKey && previous.requestId
       ? previous.requestId
@@ -617,11 +617,20 @@ function App() {
         }, IMAGE_UPLOAD_TIMEOUT_MS);
         imageIds.push(uploaded.imageId);
       }
+      const attachmentIds: string[] = [];
+      for (const attachment of attachments) {
+        const uploaded = await uploadAttachment(attachment, notice => setThreadActions(current =>
+          current[threadId]?.requestId === requestId ? { ...current, [threadId]: { ...current[threadId]!, notice } } : current));
+        attachmentIds.push(uploaded.id);
+      }
+      setThreadActions(current => current[threadId]?.requestId === requestId
+        ? { ...current, [threadId]: { ...current[threadId]!, notice: "正在提交消息" } } : current);
       const receipt = await api<WriteReceiptResponse>(`/api/threads/${encodeURIComponent(threadId)}/turns`, {
         method: "POST",
         body: JSON.stringify({
           text: message,
           images: imageIds,
+          attachments: attachmentIds,
           activeTurnId,
           requestId,
           ...(!activeTurnId && Object.prototype.hasOwnProperty.call(modelOverrides, threadId) ? { model: modelOverrides[threadId] } : {}),
@@ -699,6 +708,11 @@ function App() {
     };
     const resyncState = () => {
       subscribe();
+      const selectedThread = selectedIdRef.current;
+      if (selectedThread) {
+        threadMetadataFetchedRef.current.delete(selectedThread);
+        void loadThreadMetadata(selectedThread);
+      }
       void Promise.allSettled([
         api<AuthSessionInfo>("/api/auth/session").then(result => setSession(result)),
         loadThreads(),
@@ -753,6 +767,11 @@ function App() {
           }
           const updatedPlan = planNotification(notification);
           if (updatedPlan && updatedPlan.threadId === selectedIdRef.current) setPlanSnapshots(current => ({ ...current, [planSnapshotKey(updatedPlan.threadId, updatedPlan.turnId)]: updatedPlan }));
+          const context = contextUsageNotification(notification);
+          if (context) {
+            setThreadMetadata(current => ({ ...current, [context.threadId]: { ...current[context.threadId], id: context.threadId, contextUsage: context.usage } }));
+            return;
+          }
           if (notification.method === "model/rerouted") {
             const params = objectValue(notification.params);
             const threadId = typeof params?.threadId === "string" ? params.threadId : null;
@@ -881,6 +900,12 @@ function App() {
     }
   }, [auth, selectedId, view]);
 
+  useEffect(() => {
+    if (auth !== "signedIn" || view !== "threads" || !selectedId) return;
+    threadMetadataFetchedRef.current.delete(selectedId);
+    void loadThreadMetadata(selectedId);
+  }, [auth, selectedId, view]);
+
   if (auth === "checking") return <div className="splash"><RadioTower size={22} /><span>正在连接</span></div>;
   if (auth === "signedOut") return <Login notice={error} onSignedIn={completeSignIn} />;
 
@@ -944,7 +969,7 @@ function NavButton({ icon, label, active, count, onClick }: { icon: React.ReactN
   return <button className={`nav-button ${active ? "active" : ""}`} title={label} aria-label={label} aria-current={active ? "page" : undefined} onClick={onClick}>{icon}<span>{label}</span>{count != null && <em>{count}</em>}</button>;
 }
 
-function ThreadsView({ threads, listThreads, listTools, inspector, models, modelsError, modelOverrides, reasoningOverrides, threadMetadata, threadMetadataErrors, planSnapshots, syncing, selectedId, selected, drafts, threadActions, creating, createCwd, createBusy, createError, onSelect, onBack, onStartCreate, onCancelCreate, onCreateCwdChange, onCreate, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { threads: ThreadSummary[]; listThreads: ThreadSummary[]; listTools: React.ReactNode; inspector: React.ReactNode; models: ModelSummary[]; modelsError: string | null; modelOverrides: Record<string, string>; reasoningOverrides: ReasoningOverrides; threadMetadata: Record<string, ThreadMetadataResult>; threadMetadataErrors: Record<string, string>; planSnapshots: Record<string, PlanSnapshot>; syncing: boolean; selectedId: string | null; selected: ThreadPageResult | null; drafts: Record<string, string>; threadActions: Record<string, ThreadActionState | undefined>; creating: boolean; createCwd: string; createBusy: boolean; createError: string | null; onSelect: (id: string) => void; onBack: () => void; onStartCreate: () => void; onCancelCreate: () => void; onCreateCwdChange: (cwd: string) => void; onCreate: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (threadId: string, text: string) => void; onModelChange: (threadId: string, model: string | null) => void; onReasoningChange: (threadId: string, effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void>; }) {
+function ThreadsView({ threads, listThreads, listTools, inspector, models, modelsError, modelOverrides, reasoningOverrides, threadMetadata, threadMetadataErrors, planSnapshots, syncing, selectedId, selected, drafts, threadActions, creating, createCwd, createBusy, createError, onSelect, onBack, onStartCreate, onCancelCreate, onCreateCwdChange, onCreate, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { threads: ThreadSummary[]; listThreads: ThreadSummary[]; listTools: React.ReactNode; inspector: React.ReactNode; models: ModelSummary[]; modelsError: string | null; modelOverrides: Record<string, string>; reasoningOverrides: ReasoningOverrides; threadMetadata: Record<string, ThreadMetadataResult>; threadMetadataErrors: Record<string, string>; planSnapshots: Record<string, PlanSnapshot>; syncing: boolean; selectedId: string | null; selected: ThreadPageResult | null; drafts: Record<string, string>; threadActions: Record<string, ThreadActionState | undefined>; creating: boolean; createCwd: string; createBusy: boolean; createError: string | null; onSelect: (id: string) => void; onBack: () => void; onStartCreate: () => void; onCancelCreate: () => void; onCreateCwdChange: (cwd: string) => void; onCreate: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (threadId: string, text: string) => void; onModelChange: (threadId: string, model: string | null) => void; onReasoningChange: (threadId: string, effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[], attachments: DraftAttachment[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void>; }) {
   const desktop = useMediaQuery(DESKTOP_QUERY);
   const wide = useMediaQuery(WIDE_QUERY);
   // 桌面端把运行中的任务固定在列表顶部，其余任务仍按项目分组。
@@ -1017,7 +1042,7 @@ function LiveCard({ thread, selected, read, planSnapshots, onSelect }: { thread:
   </button>;
 }
 
-function ThreadDetail({ read, summary, metadata, metadataError, models, modelsError, modelOverride, reasoningOverride, planSnapshots, draft, action, onBack, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { read: ThreadPageResult; summary?: ThreadSummary | undefined; metadata?: ThreadMetadataResult | undefined; metadataError?: string | undefined; models: ModelSummary[]; modelsError: string | null; modelOverride: string | undefined; reasoningOverride: string | undefined; planSnapshots: Record<string, PlanSnapshot>; draft: string; action: ThreadActionState | undefined; onBack: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (text: string) => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void> }) {
+function ThreadDetail({ read, summary, metadata, metadataError, models, modelsError, modelOverride, reasoningOverride, planSnapshots, draft, action, onBack, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { read: ThreadPageResult; summary?: ThreadSummary | undefined; metadata?: ThreadMetadataResult | undefined; metadataError?: string | undefined; models: ModelSummary[]; modelsError: string | null; modelOverride: string | undefined; reasoningOverride: string | undefined; planSnapshots: Record<string, PlanSnapshot>; draft: string; action: ThreadActionState | undefined; onBack: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (text: string) => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[], attachments: DraftAttachment[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void> }) {
   const { thread, history } = read;
   const displayThread = mergeThreadMetadata(mergeThreadSummary(thread, summary), metadata);
   const turns = Array.isArray(thread.turns) ? thread.turns : [];
@@ -1045,17 +1070,19 @@ function ThreadDetail({ read, summary, metadata, metadataError, models, modelsEr
     const livePlan = typeof turnId === "string" ? planSnapshots[planSnapshotKey(thread.id, turnId)] : undefined;
     return livePlan && typeof turnId === "string" ? <Turn key={turnId} turn={turn} index={index} plan={livePlan} /> : <Turn key={typeof turnId === "string" ? turnId : index} turn={turn} index={index} />;
   });
-  return <><button className="detail-back" onClick={onBack}><ArrowLeft size={18} /><span>返回任务</span></button><div className="detail-heading"><div><p className="eyebrow">任务</p><h2>{displayThread.name || displayThread.title || "未命名任务"}</h2><span className="detail-meta"><Clock3 size={14} />{displayThread.cwd || "本地工作区"}</span></div><div className="detail-state"><span className="model-summary"><Brain size={14} />{modelLabel(models, modelOverride, displayThread)}</span><span className="reasoning-summary"><Gauge size={14} />{reasoningLabel(models, modelOverride, reasoningOverride, displayThread)}</span><span className={`state-pill ${statusClass(displayThread.status)}`}>{statusText(displayThread.status)}</span></div></div><div className="turn-list">{history.hasOlder && <button className="history-button" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}<span>加载更早记录</span><small>已显示 {turns.length} 轮</small></button>}{historyError && <p className="history-error" role="alert"><CircleAlert size={14} />{historyError}</p>}{turns.length === 0 ? <div className="empty-state compact"><Clock3 size={24} /><p>暂无可见历史</p></div> : turnViews}</div><MessageComposer text={draft} action={action} models={models} modelsError={modelsError} thread={displayThread} metadataError={metadataError} modelOverride={modelOverride} reasoningOverride={reasoningOverride} activeTurnId={activeTurnId} needsResume={needsResume} onOpenSettings={() => onLoadMetadata(thread.id)} onModelChange={onModelChange} onReasoningChange={onReasoningChange} jumpButton={<JumpToLatest away={follow.away} unseen={follow.unseen} onJump={() => follow.jump()} />} onTextChange={onDraftChange} onSend={(text, images) => { follow.jump(false); return onSend(thread.id, text, activeTurnId, images); }} onInterrupt={activeTurnId ? () => onInterrupt(thread.id, activeTurnId) : undefined} /><div className="chat-bottom" ref={bottomRef} /></>;
+  return <><button className="detail-back" onClick={onBack}><ArrowLeft size={18} /><span>返回任务</span></button><div className="detail-heading"><div><p className="eyebrow">任务</p><h2>{displayThread.name || displayThread.title || "未命名任务"}</h2><span className="detail-meta"><Clock3 size={14} />{displayThread.cwd || "本地工作区"}</span></div><div className="detail-state"><span className="model-summary"><Brain size={14} />{modelLabel(models, modelOverride, displayThread)}</span><span className="reasoning-summary"><Gauge size={14} />{reasoningLabel(models, modelOverride, reasoningOverride, displayThread)}</span><span className={`state-pill ${statusClass(displayThread.status)}`}>{statusText(displayThread.status)}</span></div></div><div className="turn-list">{history.hasOlder && <button className="history-button" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}<span>加载更早记录</span><small>已显示 {turns.length} 轮</small></button>}{historyError && <p className="history-error" role="alert"><CircleAlert size={14} />{historyError}</p>}{turns.length === 0 ? <div className="empty-state compact"><Clock3 size={24} /><p>暂无可见历史</p></div> : turnViews}</div><MessageComposer text={draft} action={action} models={models} modelsError={modelsError} thread={displayThread} metadataError={metadataError} modelOverride={modelOverride} reasoningOverride={reasoningOverride} activeTurnId={activeTurnId} needsResume={needsResume} onOpenSettings={() => onLoadMetadata(thread.id)} onModelChange={onModelChange} onReasoningChange={onReasoningChange} jumpButton={<JumpToLatest away={follow.away} unseen={follow.unseen} onJump={() => follow.jump()} />} onTextChange={onDraftChange} onSend={(text, images, attachments) => { follow.jump(false); return onSend(thread.id, text, activeTurnId, images, attachments); }} onInterrupt={activeTurnId ? () => onInterrupt(thread.id, activeTurnId) : undefined} /><div className="chat-bottom" ref={bottomRef} /></>;
 }
 
-function MessageComposer({ text, action, models, modelsError, thread, metadataError, modelOverride, reasoningOverride, activeTurnId, needsResume, onOpenSettings, onModelChange, onReasoningChange, onTextChange, onSend, onInterrupt, jumpButton }: { jumpButton?: React.ReactNode; text: string; action: ThreadActionState | undefined; models: ModelSummary[]; modelsError: string | null; thread: ThreadSummary; metadataError: string | undefined; modelOverride: string | undefined; reasoningOverride: string | undefined; activeTurnId: string | null; needsResume: boolean; onOpenSettings: () => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onTextChange: (text: string) => void; onSend: (text: string, images: DraftImage[]) => Promise<boolean>; onInterrupt: (() => Promise<void>) | undefined }) {
+function MessageComposer({ text, action, models, modelsError, thread, metadataError, modelOverride, reasoningOverride, activeTurnId, needsResume, onOpenSettings, onModelChange, onReasoningChange, onTextChange, onSend, onInterrupt, jumpButton }: { jumpButton?: React.ReactNode; text: string; action: ThreadActionState | undefined; models: ModelSummary[]; modelsError: string | null; thread: ThreadSummary; metadataError: string | undefined; modelOverride: string | undefined; reasoningOverride: string | undefined; activeTurnId: string | null; needsResume: boolean; onOpenSettings: () => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onTextChange: (text: string) => void; onSend: (text: string, images: DraftImage[], attachments: DraftAttachment[]) => Promise<boolean>; onInterrupt: (() => Promise<void>) | undefined }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [images, setImages] = useState<DraftImage[]>([]);
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const [preparingImages, setPreparingImages] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectionThreadRef = useRef(thread.id);
+  selectionThreadRef.current = thread.id;
   const imagesRef = useRef<DraftImage[]>([]);
   const busy = Boolean(action?.busy) || preparingImages;
   const actionError = action?.error || null;
@@ -1065,13 +1092,12 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
     for (const image of imagesRef.current) releaseImageAttachment(image);
     imagesRef.current = [];
     setImages([]);
-    if (fileInputRef.current) fileInputRef.current.value = "";
   };
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     const message = text.trim();
-    if ((!message && images.length === 0) || busy) return;
-    if (await onSend(message, images)) clearImages();
+    if ((!message && images.length === 0 && attachments.length === 0) || busy) return;
+    if (await onSend(message, images, attachments)) { clearImages(); setAttachments([]); }
   };
   const interrupt = async () => {
     if (!onInterrupt || busy) return;
@@ -1092,12 +1118,14 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
     requestAnimationFrame(resizeTextarea);
   };
   const feedbackError = imageError || actionError;
-  const feedback = preparingImages ? "正在处理图片" : action?.busy ? (action.kind === "interrupt" ? "正在停止任务" : needsResume ? "正在加载任务并发送" : activeTurnId ? "正在追加消息" : "正在发送") : feedbackError || actionNotice;
+  const feedback = preparingImages ? "正在整理附件" : action?.busy ? (action.notice || (action.kind === "interrupt" ? "正在停止任务" : needsResume ? "正在加载任务并发送" : activeTurnId ? "正在追加消息" : "正在发送")) : feedbackError || actionNotice;
   const effortOptions = reasoningOptions(models, modelOverride, thread);
   useEffect(() => {
     setSettingsOpen(false);
     setImageError(null);
     clearImages();
+    setAttachments([]);
+    setPreparingImages(false);
   }, [thread.id]);
   useEffect(() => () => {
     for (const image of imagesRef.current) releaseImageAttachment(image);
@@ -1112,7 +1140,6 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
   };
   const selectImages = async (files: FileList | null) => {
     const selected = Array.from(files || []);
-    if (fileInputRef.current) fileInputRef.current.value = "";
     if (selected.length === 0) return;
     const available = MAX_IMAGES_PER_MESSAGE - imagesRef.current.length;
     if (available <= 0) {
@@ -1132,6 +1159,32 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
       setPreparingImages(false);
     }
   };
+  const addAttachments = (next: DraftAttachment[]) => {
+    try { validateAttachmentDrafts([...attachments, ...next]); setAttachments(current => [...current, ...next]); }
+    catch (cause) { setImageError(cause instanceof Error ? cause.message : "附件选择失败"); }
+  };
+  const selectFiles = (files: File[], folder: boolean) => {
+    if (busy) return;
+    setImageError(null);
+    try { addAttachments(createAttachmentDrafts(files, folder)); }
+    catch (cause) { setImageError(cause instanceof Error ? cause.message : "附件选择失败"); }
+  };
+  const dropFiles = async (data: DataTransfer) => {
+    if (busy) return;
+    const entries = Array.from(data.items || []).map(item => item.webkitGetAsEntry?.());
+    if (!entries.some(entry => entry?.isDirectory) && Array.from(data.files).every(file => file.type.startsWith("image/"))) {
+      await selectImages(data.files); return;
+    }
+    const threadId = thread.id;
+    setPreparingImages(true);
+    setImageError(null);
+    try {
+      const drafts = await attachmentsFromDrop(data);
+      if (selectionThreadRef.current === threadId) addAttachments(drafts);
+    } catch (cause) {
+      if (selectionThreadRef.current === threadId) setImageError(cause instanceof Error ? cause.message : "附件选择失败");
+    } finally { if (selectionThreadRef.current === threadId) setPreparingImages(false); }
+  };
   const removeImage = (id: string) => {
     setImages(current => {
       const target = current.find(image => image.id === id);
@@ -1140,7 +1193,7 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
     });
     setImageError(null);
   };
-  return <form className={`message-composer ${dragOver ? "drag-over" : ""}`} onSubmit={submit} onDragEnter={event => { event.preventDefault(); setDragOver(true); }} onDragOver={event => { event.preventDefault(); setDragOver(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false); }} onDrop={event => { event.preventDefault(); setDragOver(false); void selectImages(event.dataTransfer.files); }}>{jumpButton}{feedback && <div className={`composer-feedback ${feedbackError ? "error" : actionNotice ? "success" : ""}`} role={feedbackError ? "alert" : "status"}>{feedbackError ? <CircleAlert size={15} /> : busy ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}<span>{feedback}</span></div>}{images.length > 0 && <div className="composer-images" aria-label="待发送图片">{images.map(image => <span className="composer-image" key={image.id}><img src={image.previewUrl} alt={image.name} /><button type="button" title="移除图片" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.id)} disabled={busy}><X size={13} /></button></span>)}</div>}{settingsOpen && <div className="composer-settings">{modelsError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{modelsError}</span></p>}{metadataError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{metadataError}</span></p>}<label className="composer-setting"><span><Brain size={15} />模型</span><select aria-label="模型" value={modelOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || models.length === 0} onChange={event => onModelChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{modelLabel(models, modelOverride, thread)}</option>{models.map(model => <option value={model.id} key={model.id}>{model.displayName}</option>)}</select></label><label className="composer-setting"><span><Gauge size={15} />推理强度</span><select aria-label="推理强度" value={reasoningOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || effortOptions.length === 0} onChange={event => onReasoningChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{reasoningTaskLabel(thread)}</option>{effortOptions.map(option => <option value={option.reasoningEffort} key={option.reasoningEffort}>{reasoningEffortLabel(option.reasoningEffort)}</option>)}</select></label>{activeTurnId && <small>任务运行中</small>}</div>}<textarea ref={textareaRef} aria-label="发送消息" placeholder={activeTurnId ? "向运行中的任务追加消息" : "发送消息"} value={text} onChange={event => updateText(event.target.value)} rows={1} /><div className="composer-actions"><label className={`composer-button utility ${busy || images.length >= MAX_IMAGES_PER_MESSAGE ? "disabled" : ""}`} title="添加图片" aria-label="添加图片"><input ref={fileInputRef} className="composer-file-input" type="file" accept="image/*,image/heic,image/heif,.heic,.heif" multiple disabled={busy || images.length >= MAX_IMAGES_PER_MESSAGE} onChange={event => void selectImages(event.currentTarget.files)} /><ImagePlus size={17} /></label><button className={`composer-button utility ${settingsOpen ? "active" : ""}`} type="button" title="模型和推理强度" aria-label="模型和推理强度" aria-expanded={settingsOpen} onClick={toggleSettings} disabled={busy}><Settings2 size={17} /></button>{onInterrupt && <button className="composer-button stop" type="button" title="停止任务" aria-label="停止任务" onClick={() => void interrupt()} disabled={busy}><Square size={16} fill="currentColor" /></button>}<button className="composer-button send" type="submit" title="发送消息" aria-label="发送消息" disabled={busy || (!text.trim() && images.length === 0)}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div></form>;
+  return <form className={`message-composer ${dragOver ? "drag-over" : ""}`} onSubmit={submit} onDragEnter={event => { event.preventDefault(); setDragOver(true); }} onDragOver={event => { event.preventDefault(); setDragOver(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false); }} onDrop={event => { event.preventDefault(); setDragOver(false); void dropFiles(event.dataTransfer); }}>{jumpButton}{feedback && <div className={`composer-feedback ${feedbackError ? "error" : actionNotice ? "success" : ""}`} role={feedbackError ? "alert" : "status"}>{feedbackError ? <CircleAlert size={15} /> : busy ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}<span>{feedback}</span></div>}{images.length > 0 && <div className="composer-images" aria-label="待发送图片">{images.map(image => <span className="composer-image" key={image.id}><img src={image.previewUrl} alt={image.name} /><button type="button" title="移除图片" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.id)} disabled={busy}><X size={13} /></button></span>)}</div>}{attachments.length > 0 && <AttachmentDrafts drafts={attachments} busy={busy} onRemove={id => setAttachments(current => current.filter(file => file.id !== id))} />}{settingsOpen && <div className="composer-settings">{modelsError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{modelsError}</span></p>}{metadataError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{metadataError}</span></p>}<label className="composer-setting"><span><Brain size={15} />模型</span><select aria-label="模型" value={modelOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || models.length === 0} onChange={event => onModelChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{modelLabel(models, modelOverride, thread)}</option>{models.map(model => <option value={model.id} key={model.id}>{model.displayName}</option>)}</select></label><label className="composer-setting"><span><Gauge size={15} />推理强度</span><select aria-label="推理强度" value={reasoningOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || effortOptions.length === 0} onChange={event => onReasoningChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{reasoningTaskLabel(thread)}</option>{effortOptions.map(option => <option value={option.reasoningEffort} key={option.reasoningEffort}>{reasoningEffortLabel(option.reasoningEffort)}</option>)}</select></label>{activeTurnId && <small>任务运行中</small>}</div>}<textarea ref={textareaRef} aria-label="发送消息" placeholder={activeTurnId ? "向运行中的任务追加消息" : "发送消息"} value={text} onChange={event => updateText(event.target.value)} rows={1} /><div className="composer-actions"><AttachmentPicker busy={busy} onImages={files => void selectImages(files)} onFiles={selectFiles} onError={setImageError} /><button className={`composer-button utility ${settingsOpen ? "active" : ""}`} type="button" title="模型和推理强度" aria-label="模型和推理强度" aria-expanded={settingsOpen} onClick={toggleSettings} disabled={busy}><Settings2 size={17} /></button><ContextUsageIndicator usage={thread.contextUsage} />{onInterrupt && <button className="composer-button stop" type="button" title="停止任务" aria-label="停止任务" onClick={() => void interrupt()} disabled={busy}><Square size={16} fill="currentColor" /></button>}<button className="composer-button send" type="submit" title="发送消息" aria-label="发送消息" disabled={busy || (!text.trim() && images.length === 0 && attachments.length === 0)}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div></form>;
 }
 
 function ApprovalPanel({ approvals, threads, onDecision }: { approvals: ApprovalRequest[]; threads: ThreadSummary[]; onDecision: (requestId: string | number, decision: "accept" | "decline") => Promise<void> }) {

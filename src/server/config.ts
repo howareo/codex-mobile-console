@@ -12,6 +12,7 @@ export interface GatewayConfig {
   sessionTtlMs: number;
   sessionStoreFile: string | null;
   imageUploadRoot?: string | null;
+  uploadRoot?: string | null;
   authRequired?: boolean;
 }
 
@@ -46,6 +47,7 @@ export async function loadGatewayConfig(env: NodeJS.ProcessEnv = process.env): P
     sessionTtlMs: sessionTtlMs(env.CODEX_MOBILE_SESSION_TTL_MS),
     sessionStoreFile: resolve(env.CODEX_MOBILE_SESSION_STORE_FILE?.trim() || ".runtime/private/sessions.json"),
     imageUploadRoot: resolve(env.CODEX_MOBILE_IMAGE_UPLOAD_ROOT?.trim() || ".runtime/private/uploads/images"),
+    uploadRoot: resolve(env.CODEX_MOBILE_UPLOAD_ROOT?.trim() || ".runtime/private/uploads/attachments"),
     authRequired: authRequiredFromEnv(env.CODEX_MOBILE_AUTH_REQUIRED)
   };
   if (cert && key) result.tls = { cert, key };

@@ -32,6 +32,7 @@ export interface ThreadStatus {
 
 export interface ThreadSummary {
   id: string;
+  contextUsage?: ThreadContextUsage;
   name?: string | null;
   title?: string | null;
   cwd?: string | null;
@@ -81,8 +82,14 @@ export interface ThreadSessionSettings {
   reasoningEffort?: string | null;
 }
 
+export interface ThreadContextUsage {
+  usedTokens: number;
+  modelContextWindow: number | null;
+}
+
 export interface ThreadMetadataResult extends ThreadSessionSettings {
   id: string;
+  contextUsage?: ThreadContextUsage;
 }
 
 export interface ThreadReadResult extends ThreadSessionSettings {

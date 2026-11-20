@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from "react";
-import { Brain, ChevronDown, CircleAlert, FilePenLine, Image, ListChecks, LoaderCircle, Search, Terminal, Wrench } from "lucide-react";
+import { Brain, ChevronDown, CircleAlert, File as FileIcon, FilePenLine, FolderClosed, Image, ListChecks, LoaderCircle, Search, Terminal, Wrench } from "lucide-react";
 import { isConversationItem, itemDetails, itemId, itemImages, itemRecord, itemRole, itemSummary, itemText, itemType, statusClass, statusText, statusValue, toolLabel } from "./thread-items";
 import { MarkdownMessage } from "./message-markdown";
 import { ToolDetails, type DetailRequest } from "./tool-details";
+import { parseAttachmentMessage } from "./file-attachments";
 
 type TurnBlock = { kind: "item"; item: unknown } | { kind: "activity"; items: unknown[] };
 
@@ -41,9 +42,10 @@ function ThreadItem({ item, time = null, request }: { item: unknown; time?: stri
   const role = itemRole(item);
   if (role === "system") return <div className="system-row"><span>{toolLabel(item)}</span></div>;
   if (isConversationItem(item)) {
-    const text = itemText(item);
+    const message = role === "user" ? parseAttachmentMessage(itemText(item)) : { text: itemText(item), attachments: [] };
+    const { text, attachments } = message;
     const images = itemImages(item);
-    return <div className={`message-row ${role}`}><span className="message-avatar">{role === "user" ? "我" : "C"}</span><div className="message-stack"><div className={`message-bubble ${images.length > 0 ? "has-images" : ""}`}>{images.length > 0 && <div className="message-images">{images.map(image => <a href={image.src} target="_blank" rel="noreferrer" key={image.imageId}><img src={image.src} alt={role === "user" ? "已上传图片" : "Codex 图片"} loading="lazy" /></a>)}</div>}{text && <MarkdownMessage text={text} />}{!text && images.length === 0 && "（空消息）"}</div>{time && <time className="message-time">{time}</time>}</div></div>;
+    return <div className={`message-row ${role}`}><span className="message-avatar">{role === "user" ? "我" : "C"}</span><div className="message-stack"><div className={`message-bubble ${images.length > 0 ? "has-images" : ""}`}>{images.length > 0 && <div className="message-images">{images.map(image => <a href={image.src} target="_blank" rel="noreferrer" key={image.imageId}><img src={image.src} alt={role === "user" ? "已上传图片" : "Codex 图片"} loading="lazy" /></a>)}</div>}{text && <MarkdownMessage text={text} />}{attachments.length > 0 && <div className="message-attachments">{attachments.map(file => <span className="attachment-chip" key={file.id}>{file.kind === "folder" ? <FolderClosed size={17} /> : <FileIcon size={17} />}<strong title={file.name}>{file.name}</strong></span>)}</div>}{!text && images.length === 0 && attachments.length === 0 && "（空消息）"}</div>{time && <time className="message-time">{time}</time>}</div></div>;
   }
   return <ToolCard item={item} request={request} />;
 }

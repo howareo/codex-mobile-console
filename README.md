@@ -89,7 +89,11 @@ https://<WINDOWS_PRIVATE_IP>:4174/
 
 任务列表右上角可以新建会话。工作目录从已有项目中选择，或输入 Windows 绝对路径。新建只会调用共享 4500 的 `thread/start`，不会改 `state_5.sqlite`，也不会启动第二个 app-server。
 
-聊天输入栏支持一次选择最多 4 张图片，也可以把图片拖到输入框。目前只支持图片，不支持 PDF 或其他文件。较大的照片会先在手机端压缩，再通过已认证的 4174 HTTPS 网关保存到 Windows 的 `.runtime\private\uploads\images`，随后以 `localImage` 交给共享 4500；图片文件和密钥一样不会提交到 Git。Codex 回图（`imageView` / `imageGeneration`）会显示在对话里：网关只把已签名的认证地址发给手机，不把 Windows 原路径暴露到网页。
+聊天输入栏点击回形针，可选择「照片或图片」「文件或压缩包」「文件夹」，也可以拖入文件或文件夹。附件在发送时上传，并显示进度；文件夹保留内部层级，ZIP 等压缩包原样保存，不自动解压。每条消息最多 10 个文件附件，单文件最多 100 MiB，单个文件夹最多 256 MiB、2,000 个文件。手机浏览器若不支持选择文件夹，请先压缩为 ZIP 后上传。
+
+文件附件保存在 Windows 的 `.runtime\private\uploads\attachments`，发送时把已登记附件的路径交给共享 4500，由 Codex 按需读取。附件不提交到 Git，聊天页面只显示名称。图片仍使用独立通道：一次最多 4 张，每张上传上限 8 MiB；较大照片会先在手机端压缩，保存到 `.runtime\private\uploads\images`，再以 `localImage` 交给共享 4500。Codex 回图（`imageView` / `imageGeneration`）会显示在对话里：网关只把已签名的认证地址发给手机，不把 Windows 原路径暴露到网页。
+
+Codex 输入栏的上下文圆环显示当前已用比例，点击可展开查看剩余比例和 token 数。打开旧会话时读取最近记录，运行时随真实 token 通知更新；尚无记录或模型未报告容量时显示「未知」，不按累计 token 猜测。
 
 ## 部署（新机器第一次安装）
 
