@@ -36,6 +36,15 @@ export function sendErrorText(cause: unknown): string {
   return withRetry(message, "发送失败，消息已保留，请重试");
 }
 
+export function createErrorText(cause: unknown): string {
+  const message = errorDetail(cause);
+  if (/cwd must be an absolute/i.test(message)) return "请选择已有项目目录，或输入绝对路径";
+  if (/401|unauthorized/i.test(message)) return "登录已失效，请重新输入配对密钥";
+  if (/timed out|timeout/i.test(message)) return withRetry("创建会话超时", "请重试");
+  if (/network|failed to fetch/i.test(message)) return "网络连接中断，会话尚未创建";
+  return withRetry(message, "创建会话失败，请重试");
+}
+
 export function interruptErrorText(cause: unknown): string {
   const message = errorDetail(cause);
   if (/timed out|timeout/i.test(message)) return withRetry("停止请求超时", "请确认任务状态后重试");

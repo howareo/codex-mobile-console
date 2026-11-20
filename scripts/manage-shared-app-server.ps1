@@ -13,6 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
 $HostAddress = Resolve-MobileHostAddress $HostAddress
+. (Join-Path $PSScriptRoot 'get-managed-app-server.ps1')
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $taskName = 'Codex Mobile Console'
 $url = [Uri]$ListenUrl
@@ -23,13 +24,7 @@ function Get-Listener {
 }
 
 function Get-VerifiedOwner {
-  $listener = Get-Listener
-  if (-not $listener) { return $null }
-  $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction Stop
-  if ($listener.LocalAddress -notin @('127.0.0.1', '::1') -or $owner.Name -ine 'codex.exe' -or $owner.CommandLine -notmatch '\bapp-server\b') {
-    throw "端口 $($url.Port) 不是受管 Codex app-server，未操作该进程。"
-  }
-  return $owner
+  return Resolve-ManagedAppServerOwner -Port $url.Port -AllowMissing
 }
 
 function Get-StopBlockers {
@@ -52,7 +47,7 @@ if ($Action -eq 'Start') {
   if ($owner) {
     Write-Output "4500 已经运行，PID $($owner.ProcessId)，未启动第二个实例。"
   } else {
-    $other = @(Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq 'codex.exe' -and $_.CommandLine -match '\bapp-server\b' })
+    $other = @(Get-AppServerCandidateProcesses -Port $url.Port)
     if ($other.Count -gt 0) { throw "检测到其他 app-server（PID：$($other.ProcessId -join ', ')），未启动第二个实例。" }
     & (Join-Path $PSScriptRoot 'ensure-mobile-stack.ps1') -HostAddress $HostAddress -GatewayPort $GatewayPort -AppServerUrl $ListenUrl
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)

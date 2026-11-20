@@ -1,5 +1,8 @@
+import { registerClaudeProxy } from "./claude-proxy.js";
+import { createClaudeVersionReporter, type ClaudeVersions } from "./claude-versions.js";
+import { registerToolDetails, toolDetailsUrl } from "./tool-details.js";
 import { existsSync, readFileSync } from "node:fs";
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
@@ -9,9 +12,12 @@ import websocket from "@fastify/websocket";
 import type { WebSocket } from "ws";
 import { AppServerClient, type AppServerFrame, type AppServerRequestPriority } from "../protocol/app-server-client.js";
 import type { ApprovalRequest, JsonObject, LoadedTasksDiagnosticsResult, ModelListResult, RpcId, RpcNotification, ThreadMetadataResult, ThreadPageResult, ThreadSummary, TurnInput } from "../shared/types.js";
+import { normalizeThreadCwd } from "../shared/cwd.js";
 import type { GatewayConfig } from "./config.js";
 import { GatewayLogger, RollingGatewayMetrics, type LogLevel } from "./diagnostics.js";
 import { SessionStore } from "./sessions.js";
+import { isCodexMaintenanceRequest, maintenanceActive } from "./maintenance.js";
+import { codexImageSourcePath, isCodexImageItemType, localImageAbsolutePath, localImagePublicName, signLocalImageToken, signMarkdownLocalImages, verifyLocalImageToken } from "./local-images.js";
 
 const COOKIE_NAME = "codex_mobile_session";
 const MOBILE_TURN_PAGE_SIZE = 10;
@@ -44,7 +50,7 @@ interface WriteReceipt {
   promise: Promise<unknown>;
 }
 
-export async function createGatewayApp(config: GatewayConfig, upstream: AppServerClient, logger = new GatewayLogger(config.logFile)): Promise<FastifyInstance> {
+export async function createGatewayApp(config: GatewayConfig, upstream: AppServerClient, logger = new GatewayLogger(config.logFile), claudeVersions: () => Promise<ClaudeVersions> = createClaudeVersionReporter()): Promise<FastifyInstance> {
   const app = Fastify({
     logger: false,
     https: config.tls ? { cert: readFileSync(config.tls.cert), key: readFileSync(config.tls.key) } : undefined
@@ -77,6 +83,31 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   let modelListInFlight: Promise<ModelListResult> | null = null;
   const startedAt = Date.now();
   const runtimeDir = config.logFile ? dirname(config.logFile) : null;
+  const maintenancePath = runtimeDir ? join(runtimeDir, "gateway-maintenance.json") : null;
+  const maintenanceStatusPath = runtimeDir ? join(runtimeDir, "gateway-maintenance-status.json") : null;
+  const gatewayRequests = new Set<string>();
+  let maintenancePublishing = false;
+  let maintenancePublishedAt = 0;
+  const publishMaintenance = async (): Promise<void> => {
+    if (!maintenanceStatusPath || maintenancePublishing) return;
+    const requested = maintenanceActive(maintenancePath);
+    if (!requested && Date.now() - maintenancePublishedAt < 10_000) return;
+    maintenancePublishing = true;
+    try {
+      const marker = requested && maintenancePath
+        ? JSON.parse(readFileSync(maintenancePath, "utf8")) : null;
+      // Write then rename so the reload script never reads a half-written ack.
+      const tmp = `${maintenanceStatusPath}.${process.pid}.tmp`;
+      await writeFile(tmp, JSON.stringify({ pid: process.pid, nonce: marker?.nonce ?? null,
+        activeRequests: gatewayRequests.size, updatedAt: new Date().toISOString() }));
+      await rename(tmp, maintenanceStatusPath);
+      maintenancePublishedAt = Date.now();
+    } catch (error) { logger.error("maintenance.status_failed", { error }); }
+    finally { maintenancePublishing = false; }
+  };
+  const maintenanceTimer = setInterval(() => { void publishMaintenance(); }, 500);
+  maintenanceTimer.unref();
+  app.addHook("onClose", async () => { clearInterval(maintenanceTimer); });
   let snapshotsRunning = false;
   let lastSnapshotAt: string | null = null;
   let lastSnapshotErrorAt: string | null = null;
@@ -85,6 +116,35 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   let snapshotFlushTimer: ReturnType<typeof setTimeout> | undefined;
   await app.register(cookie);
   await app.register(websocket);
+  // Gate hooks run after @fastify/websocket's own onRequest marks upgrades;
+  // otherwise a refused handshake (403/503) never destroys its raw socket and
+  // app.close() waits on it forever.
+  // Browsers always send Origin on cross-site POST and WebSocket handshakes.
+  // Requests without Origin (same-origin GET, local tools, tests) stay allowed.
+  app.addHook("onRequest", async (request, reply) => {
+    const origin = request.headers.origin;
+    if (origin === undefined) return;
+    const path = request.url.split("?", 1)[0] ?? "";
+    if (!path.startsWith("/api/")) return;
+    const mutating = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+    if (!mutating && path !== "/api/events") return;
+    if (origin === `${request.protocol}://${request.headers.host}`) return;
+    logger.warn("http.origin_rejected", { requestId: request.id, method: request.method, route: path });
+    return reply.code(403).send({ error: "仅接受当前页面发起的操作，请刷新后重试" });
+  });
+  app.addHook("onRequest", async (request, reply) => {
+    if (!isCodexMaintenanceRequest(request.routeOptions.url ?? request.url)) return;
+    if (maintenanceActive(maintenancePath)) {
+      reply.header("Retry-After", "5");
+      return reply.code(503).send({ code: "CODEX_MAINTENANCE", error: "Codex 正在维护重载，请稍后重试；本次请求尚未执行，Claude 不受影响。" });
+    }
+    gatewayRequests.add(request.id);
+  });
+  // onResponse only follows the socket's finish/error, which an aborted phone
+  // request may never emit. onSend marks the handler's upstream work as done
+  // (not the client disconnect), so drain still waits for an in-flight turn.
+  app.addHook("onSend", async (request, _reply, payload) => { gatewayRequests.delete(request.id); return payload; });
+  app.addHook("onResponse", async request => { gatewayRequests.delete(request.id); });
   app.addContentTypeParser([...IMAGE_MIME_TYPES], { parseAs: "buffer", bodyLimit: MAX_IMAGE_UPLOAD_BYTES }, (_request, body, done) => done(null, body));
 
   // Fastify's default 500 response hides the useful upstream message. Keep
@@ -114,9 +174,6 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     requestStartedAt.delete(request.id);
     logger.info("http.response", { requestId: request.id, method: request.method, route: request.routeOptions.url || request.url.split("?", 1)[0], statusCode: reply.statusCode, durationMs: beganAt ? Date.now() - beganAt : null });
   });
-  app.addHook("onError", async (request, reply, error) => {
-    logger.error("http.error", { requestId: request.id, method: request.method, route: request.routeOptions.url || request.url.split("?", 1)[0], statusCode: reply.statusCode, error: publicErrorMessage(error) });
-  });
   const staticRoot = config.staticRoot;
   if (existsSync(staticRoot)) {
     await app.register(fastifyStatic, {
@@ -145,6 +202,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   const requireSession = async (request: FastifyRequest, reply: FastifyReply): Promise<void> => {
     reply.header("Cache-Control", "no-store");
+    if (config.authRequired === false) return;
     const id = request.cookies[COOKIE_NAME];
     const session = sessions.use(id, request.method !== "DELETE");
     if (!session) {
@@ -241,13 +299,13 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   // 同一任务的首页快照只保留一个在途 RPC，历史分页仍按各自游标独立读取。
   const loadThreadPage = (threadId: string, cursor?: string, priority: AppServerRequestPriority = "foreground"): Promise<ThreadPageResult> => {
-    if (cursor) return mobileThreadPage(upstream, threadId, cursor, priority);
+    if (cursor) return mobileThreadPage(upstream, threadId, cursor, priority, config.pairingSecret);
     // Detail snapshots are turns-only; session settings come from the existing
     // thread/list summary and are merged by the mobile client.
     const inFlightKey = `${priority}:${threadId}`;
     const existing = threadPageInFlight.get(inFlightKey);
     if (existing) return existing;
-    const request = mobileThreadPage(upstream, threadId, undefined, priority);
+    const request = mobileThreadPage(upstream, threadId, undefined, priority, config.pairingSecret);
     threadPageInFlight.set(inFlightKey, request);
     const clearInFlight = () => {
       if (threadPageInFlight.get(inFlightKey) === request) threadPageInFlight.delete(inFlightKey);
@@ -309,7 +367,18 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   const ensureThreadSubscription = async (threadId: string): Promise<void> => {
     await runThreadLifecycle(threadId, async () => {
       if (subscribedThreads.has(threadId)) return;
-      await upstream.resumeThread(threadId);
+      try {
+        await upstream.resumeThread(threadId);
+      } catch (error) {
+        // A thread/start result lives in memory until the first user message
+        // writes a rollout. Resume would look up that rollout and fail.
+        if (isUnmaterializedThreadError(error)) {
+          subscribedThreads.add(threadId);
+          logger.info("thread.resume_skipped_unmaterialized", { threadId });
+          return;
+        }
+        throw error;
+      }
       subscribedThreads.add(threadId);
       logger.info("thread.resumed", { threadId });
     });
@@ -413,6 +482,13 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     return `<!doctype html><meta charset="utf-8"><title>Updating</title><body style="background:#101210;color:#e8ece9;font-family:system-ui;padding:24px">Updating mobile console...<script>(async()=>{if("serviceWorker"in navigator){for(const registration of await navigator.serviceWorker.getRegistrations())await registration.unregister()}if("caches"in window){for(const key of await caches.keys())await caches.delete(key)}location.replace("/?v=2026080902")})()</script></body>`;
   });
 
+  registerClaudeProxy(app, requireSession, config.pairingSecret);
+
+  // ok/service identify a live gateway; upstream and maintenance tell the
+  // watchdog whether that live gateway can actually serve Codex requests.
+  app.get("/api/healthz", async () => ({ service: "codex-mobile-console", ok: true,
+    upstream: upstream.connectionState ?? "unknown", maintenance: maintenanceActive(maintenancePath) }));
+
   app.get("/api/health", { preHandler: requireSession }, async () => ({
     ok: true,
     phase: "read-write",
@@ -423,6 +499,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   app.get("/api/models", { preHandler: requireSession }, async () => loadModelList());
 
   app.get("/api/diagnostics/status", { preHandler: requireSession }, async () => ({
+    maintenance: { active: maintenanceActive(maintenancePath), scope: "codex" },
     startedAt: new Date(startedAt).toISOString(),
     uptimeMs: Date.now() - startedAt,
     upstream: {
@@ -447,6 +524,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     approvals: approvals.size,
     unsubscribeFailures: [...unsubscribeFailures.entries()].map(([threadId, value]) => ({ threadId, ...value })),
     config: await readConfigReloadStatus(),
+    claude: await claudeVersions(),
     log: { enabled: Boolean(config.logFile), fileName: logger.fileName }
   }));
 
@@ -489,7 +567,12 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
       return reply.code(401).send({ error: "invalid pairing token" });
     }
     const session = sessions.create();
-    await sessions.flush();
+    try {
+      await sessions.flush();
+    } catch {
+      sessions.revoke(session.id);
+      return reply.code(503).send({ error: "session storage unavailable" });
+    }
     reply.header("Cache-Control", "no-store");
     setSessionCookie(reply, session.id, session.expiresAt);
     logger.info("auth.login_succeeded", { requestId: request.id });
@@ -498,13 +581,19 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
 
   app.get("/api/auth/session", { preHandler: requireSession }, async request => {
     const session = sessions.use(request.cookies[COOKIE_NAME], false);
-    return session ? { ok: true, epoch: session.epoch, expiresAt: session.expiresAt } : { ok: false };
+    if (session) return { ok: true, epoch: session.epoch, expiresAt: session.expiresAt };
+    if (config.authRequired === false) return { ok: true, epoch: "local", expiresAt: Date.now() + config.sessionTtlMs };
+    return { ok: false };
   });
 
   app.delete("/api/auth/session", { preHandler: requireSession }, async (request, reply) => {
-    sessions.revoke(request.cookies[COOKIE_NAME]);
-    await sessions.flush();
+    const sessionId = request.cookies[COOKIE_NAME];
+    sessions.revoke(sessionId);
+    for (const [socket, socketSessionId] of socketSessionIds) {
+      if (socketSessionId === sessionId) socket.close(1008, "session revoked");
+    }
     reply.clearCookie(COOKIE_NAME, { path: "/" });
+    await sessions.flush();
     logger.info("auth.logout", { requestId: request.id });
     return { ok: true };
   });
@@ -539,7 +628,35 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     }
   });
 
+  app.get<{ Querystring: { t?: string } }>("/api/local-images", { preHandler: requireSession }, async (request, reply) => {
+    const path = verifyLocalImageToken(request.query.t ?? "", config.pairingSecret);
+    if (!path) return reply.code(404).send({ error: "image not found" });
+    try {
+      const body = await readFile(path);
+      if (body.length === 0 || body.length > MAX_IMAGE_UPLOAD_BYTES) return reply.code(404).send({ error: "image not found" });
+      const mimeType = detectImageMime(body);
+      if (!mimeType) return reply.code(404).send({ error: "image not found" });
+      logger.info("image.local_served", { requestId: request.id, name: localImagePublicName(path), mimeType, size: body.length });
+      return reply.type(mimeType).header("Cache-Control", "private, max-age=3600").send(body);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return reply.code(404).send({ error: "image not found" });
+      throw error;
+    }
+  });
+
   app.get("/api/threads", { preHandler: requireSession }, async () => loadThreadList());
+
+  app.post<{ Body: { cwd?: unknown } }>("/api/threads", { preHandler: requireSession }, async (request, reply) => {
+    const cwd = normalizeThreadCwd(request.body?.cwd);
+    if (!cwd) return reply.code(400).send({ error: "cwd must be an absolute workspace path" });
+    const result = await upstream.startThread({ cwd });
+    const thread = result.thread;
+    if (!thread || typeof thread.id !== "string" || !thread.id) return reply.code(502).send({ error: "thread/start did not return a thread" });
+    threadListCache = null;
+    subscribedThreads.add(thread.id);
+    logger.info("thread.started", { requestId: request.id, threadId: thread.id });
+    return { thread };
+  });
 
   // Detail history stays turns-only. Session parameters are fetched only when
   // the mobile user explicitly opens the composer settings for this task.
@@ -556,6 +673,8 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   app.get<{ Params: { threadId: string }; Querystring: { cursor?: string } }>("/api/threads/:threadId", { preHandler: requireSession }, async request => {
     return loadThreadPage(request.params.threadId, request.query.cursor);
   });
+
+  registerToolDetails(app, requireSession, upstream);
 
   app.post<{ Params: { threadId: string }; Body: { text?: string; images?: unknown; activeTurnId?: string; requestId?: string; model?: string | null; reasoningEffort?: string | null } }>("/api/threads/:threadId/turns", { preHandler: requireSession }, async (request, reply) => {
     const text = typeof request.body?.text === "string" ? request.body.text.trim() : "";
@@ -603,14 +722,24 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     const action = (async () => {
       if (activeTurnId) {
         await ensureThreadSubscription(request.params.threadId);
-        const result = await upstream.steerTurn(request.params.threadId, activeTurnId, upstreamInput);
-        threadListCache = null;
-        return { requestId, acceptedAt, mode: "steer", ...result };
+        try {
+          const result = await upstream.steerTurn(request.params.threadId, activeTurnId, upstreamInput);
+          threadListCache = null;
+          return { requestId, acceptedAt, mode: "steer", ...result };
+        } catch (error) {
+          // Only an explicit rejection proves the input was not accepted.
+          if (!isNoActiveTurnError(error)) throw error;
+          logger.info("write.start_after_finished_turn", { requestId, threadId: request.params.threadId });
+        }
       }
       // thread/read supplies persisted settings without instantiating the
       // task. Resume once per gateway connection to subscribe mobile realtime
       // updates; repeated sends on the same task reuse that subscription.
-      const sessionSettings = await upstream.readThreadMetadata(request.params.threadId);
+      const metadata = await upstream.readThreadMetadata(request.params.threadId);
+      const sessionSettings = {
+        model: metadata.model ?? metadata.thread.model ?? null,
+        reasoningEffort: metadata.reasoningEffort ?? metadata.thread.reasoningEffort ?? null
+      };
       let selectedModelInfo: ModelListResult["data"][number] | undefined;
       if (hasModel || hasReasoningEffort) {
         const models = await loadModelList();
@@ -621,12 +750,12 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
           ? models.data.find(candidate => candidate.id === selectedModel || candidate.model === selectedModel)
           : sessionModel;
         if (hasModel && selectedModel !== null && !selectedModelInfo) {
-          const error = new Error("model is not available") as Error & { statusCode?: number };
+          const error = new Error(`模型 ${selectedModel} 不在当前共享 4500 的模型目录中。请检查待重载状态，或在模型选择中恢复会话设置。`) as Error & { statusCode?: number };
           error.statusCode = 400;
           throw error;
         }
         if (hasReasoningEffort && selectedReasoningEffort !== null && !selectedModelInfo?.supportedReasoningEfforts.some(option => option.reasoningEffort === selectedReasoningEffort)) {
-          const error = new Error("reasoning effort is not available for this model") as Error & { statusCode?: number };
+          const error = new Error(`当前模型 ${selectedModelInfo?.model ?? sessionSettings.model ?? "未知"} 不支持推理强度 ${selectedReasoningEffort}。请重新选择强度，或恢复会话设置。`) as Error & { statusCode?: number };
           error.statusCode = 400;
           throw error;
         }
@@ -666,6 +795,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     } catch (error) {
       writeReceipts.delete(receiptKey);
       const statusCode = errorStatusCode(error) ?? 500;
+      logger.warn("write.failed", { requestId, threadId: request.params.threadId, statusCode, error: publicErrorMessage(error) });
       if (statusCode !== 500) return reply.code(statusCode).send({ error: publicErrorMessage(error), status: statusCode });
       throw error;
     } finally {
@@ -710,18 +840,26 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
   });
 
   app.get("/api/events", { websocket: true }, (socket: WebSocket, request: FastifyRequest) => {
+    gatewayRequests.delete(request.id);
     const sessionId = request.cookies[COOKIE_NAME];
-    if (!sessions.use(sessionId, false) || !sessionId) {
+    if (config.authRequired !== false && (!sessions.use(sessionId, false) || !sessionId)) {
       logger.warn("ws.auth_rejected", { requestId: request.id });
       socket.close(1008, "unauthorized");
       return;
     }
     sockets.add(socket);
     socketPongAt.set(socket, Date.now());
-    socketSessionIds.set(socket, sessionId);
+    if (sessionId) socketSessionIds.set(socket, sessionId);
     logger.info("ws.open", { requestId: request.id, sockets: sockets.size });
     socket.on("pong", () => socketPongAt.set(socket, Date.now()));
     socket.on("message", raw => {
+      if (maintenanceActive(maintenancePath)) {
+        // Dropping a subscribe silently leaves the phone believing it is live;
+        // 1013 makes it reconnect and resubscribe after the window closes.
+        logger.info("ws.maintenance_closed", { requestId: request.id });
+        socket.close(1013, "codex maintenance");
+        return;
+      }
       let message: JsonObject | null;
       try {
         message = objectValue(JSON.parse(raw.toString()));
@@ -778,7 +916,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     const now = Date.now();
     for (const socket of sockets) {
       if (socket.readyState !== 1) continue;
-      if (!sessions.use(socketSessionIds.get(socket), false)) {
+      if (config.authRequired !== false && !sessions.use(socketSessionIds.get(socket), false)) {
         logger.warn("ws.session_expired", { sockets: sockets.size });
         socket.close(1008, "session expired");
         continue;
@@ -834,8 +972,9 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
         if (threadId) releaseThreadIfUnused(threadId);
       }
     }
-    const outbound = compactNotification(message);
-    const globalNotification = notification?.method.startsWith("connection/") || notification?.method === "serverRequest/resolved" || notification?.method === "approval/resolved";
+    const outbound = compactNotification(message, config.pairingSecret);
+    // model/rerouted changes which model answers; surface it on every open page, not only the subscribed task.
+    const globalNotification = notification?.method.startsWith("connection/") || notification?.method === "serverRequest/resolved" || notification?.method === "approval/resolved" || notification?.method === "model/rerouted";
     if (notification && targetThreadId && !globalNotification) {
       broadcastToThread(sockets, subscriptions, targetThreadId, outbound, logger);
     } else {
@@ -846,7 +985,7 @@ export async function createGatewayApp(config: GatewayConfig, upstream: AppServe
     const approval = approvalValue(message);
     if (approval && APPROVAL_METHODS.has(approval.method)) approvals.set(String(approval.id), approval);
     logger.info("upstream.server_request", { method: approval?.method || "unknown", approvalId: approval?.id, approvals: approvals.size });
-    broadcast(sockets, { method: "connection/serverRequest", params: { message: compactNotification(message) } }, logger);
+    broadcast(sockets, { method: "connection/serverRequest", params: { message: compactNotification(message, config.pairingSecret) } }, logger);
   });
   upstream.on("frame", (frame: AppServerFrame) => {
     const routineSnapshot = frame.method === "thread/turns/list" && frame.ok !== false && (frame.durationMs ?? 0) < 2000;
@@ -960,6 +1099,17 @@ function errorStatusCode(error: unknown): number | null {
   return match ? Number(match[1]) : null;
 }
 
+function isUnmaterializedThreadError(error: unknown): boolean {
+  const object = objectValue(error);
+  const message = error instanceof Error ? error.message : typeof object?.message === "string" ? object.message : String(error);
+  return /no rollout found for thread id|not materialized yet|unavailable before first user message/i.test(message);
+}
+
+function isNoActiveTurnError(error: unknown): boolean {
+  return objectValue(error)?.code === -32600 && error instanceof Error
+    && /^(?:-32600:\s*)?no active turn to steer$/i.test(error.message.trim());
+}
+
 function isThreadNotFoundError(error: unknown): boolean {
   const object = objectValue(error);
   const message = error instanceof Error ? error.message : typeof object?.message === "string" ? object.message : "";
@@ -1041,42 +1191,69 @@ function backgroundSnapshotPauseReason(activeWrites: number, approvals: number, 
   return pendingRequests >= MAX_CONCURRENT_SNAPSHOTS ? "upstream_busy" : null;
 }
 
-async function mobileThreadPage(upstream: AppServerClient, threadId: string, cursor?: string, priority: AppServerRequestPriority = "foreground"): Promise<ThreadPageResult> {
-  // Viewing a task must stay read-only. Resume only immediately before a
-  // user-started turn, so opening or refreshing an archived task cannot
-  // trigger app-server lifecycle changes.
-  const page = await upstream.listThreadTurns(threadId, cursor || null, MOBILE_TURN_PAGE_SIZE, priority);
-  const olderCursor = page.nextCursor ?? null;
+
+function emptyThreadPage(threadId: string, cursor?: string): ThreadPageResult {
   return {
     thread: {
       id: threadId,
-      turns: [...page.data].reverse().map(mobileTurn)
+      turns: []
     },
     history: {
       kind: cursor ? "older" : "head",
-      olderCursor,
-      hasOlder: olderCursor !== null
+      olderCursor: null,
+      hasOlder: false
     }
   };
 }
 
-function mobileTurn(value: unknown): unknown {
+async function mobileThreadPage(upstream: AppServerClient, threadId: string, cursor: string | undefined, priority: AppServerRequestPriority, pairingSecret: string): Promise<ThreadPageResult> {
+  // Viewing a task must stay read-only. Resume only immediately before a
+  // user-started turn, so opening or refreshing an archived task cannot
+  // trigger app-server lifecycle changes.
+  try {
+    const page = await upstream.listThreadTurns(threadId, cursor || null, MOBILE_TURN_PAGE_SIZE, priority);
+    const olderCursor = page.nextCursor ?? null;
+    return {
+      thread: {
+        id: threadId,
+        turns: [...page.data].reverse().map(turn => mobileTurn(turn, pairingSecret, threadId, cursor))
+      },
+      history: {
+        kind: cursor ? "older" : "head",
+        olderCursor,
+        hasOlder: olderCursor !== null
+      }
+    };
+  } catch (error) {
+    // Codex 0.155+ refuses thread/turns/list on a brand-new thread until the
+    // first user message materializes it. That is an empty chat, not a gateway failure.
+    if (isUnmaterializedThreadError(error)) return emptyThreadPage(threadId, cursor);
+    throw error;
+  }
+}
+
+function mobileTurn(value: unknown, pairingSecret: string, threadId: string, pageCursor?: string): unknown {
   const turn = objectValue(value);
   if (!turn) return value;
   return {
     ...turn,
-    items: Array.isArray(turn.items) ? turn.items.map(mobileItem) : []
+    items: Array.isArray(turn.items) ? turn.items.map(item => mobileItem(item, pairingSecret,
+      typeof turn.id === "string" ? { threadId, turnId: turn.id, ...(pageCursor ? { pageCursor } : {}) } : undefined)) : []
   };
 }
 
-function mobileItem(value: unknown): unknown {
+function mobileItem(value: unknown, pairingSecret: string, detailRef?: { threadId: string; turnId: string; pageCursor?: string }): unknown {
   const item = objectValue(value);
   if (!item) return value;
   const type = typeof item.type === "string" ? item.type : "unknown";
   const projected: JsonObject = {};
   copyMobileFields(projected, item, ["id", "type", "status", "state", "createdAt", "updatedAt"]);
+  if (detailRef && ["fileChange", "commandExecution"].includes(type) && (typeof item.id === "string" || typeof item.id === "number")) {
+    projected.detailsUrl = toolDetailsUrl(detailRef.threadId, detailRef.turnId, String(item.id), detailRef.pageCursor);
+  }
   if (type === "userMessage" || type === "agentMessage") {
     copyMobileFields(projected, item, ["text", "summary"]);
+    if (type === "agentMessage" && typeof projected.text === "string") projected.text = signMarkdownLocalImages(projected.text, pairingSecret, existsSync);
     if (Array.isArray(item.content)) projected.content = item.content.slice(0, 40).map(mobileConversationInput).filter(value => value !== undefined);
     return projected;
   }
@@ -1103,7 +1280,21 @@ function mobileItem(value: unknown): unknown {
   const preview = outputPreview(item.result ?? item.output ?? item.aggregatedOutput);
   if (preview) projected.result = preview;
   if (Array.isArray(item.results)) projected.resultCount = item.results.length;
+  attachCodexImage(projected, item, pairingSecret);
   return projected;
+}
+
+function attachCodexImage(projected: JsonObject, item: JsonObject, pairingSecret: string): void {
+  const type = typeof item.type === "string" ? item.type : "";
+  if (!isCodexImageItemType(type)) return;
+  const raw = codexImageSourcePath(item);
+  if (!raw) return;
+  const absolute = localImageAbsolutePath(raw);
+  if (!absolute) return;
+  if (type === "imageGeneration" || type === "ImageGeneration") projected.savedPath = localImagePublicName(absolute);
+  else projected.path = localImagePublicName(absolute);
+  if (!existsSync(absolute)) return;
+  projected.src = `/api/local-images?t=${signLocalImageToken(absolute, pairingSecret)}`;
 }
 
 function mobileConversationInput(value: unknown): unknown {
@@ -1152,12 +1343,19 @@ function compactText(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}\n…（手机端已截断）`;
 }
 
-function compactNotification(value: unknown): unknown {
+function compactNotification(value: unknown, pairingSecret: string): unknown {
   const object = objectValue(value);
   if (!object || typeof object.method !== "string") return value;
-  const params = object.params === undefined ? undefined : compactMobileValue(object.params);
+  const sourceParams = objectValue(object.params);
+  let params: unknown = object.params;
+  if (sourceParams?.item !== undefined) {
+    params = { ...sourceParams, item: mobileItem(sourceParams.item, pairingSecret,
+      typeof sourceParams.threadId === "string" && typeof sourceParams.turnId === "string"
+        ? { threadId: sourceParams.threadId, turnId: sourceParams.turnId } : undefined) };
+  }
+  const compacted = params === undefined ? undefined : compactMobileValue(params);
   const result: JsonObject = { method: object.method };
-  if (params !== undefined) result.params = params;
+  if (compacted !== undefined) result.params = compacted;
   const raw = JSON.stringify(result);
   return raw.length <= 16_000 ? result : { method: object.method, params: { preview: compactText(raw, 12_000) } };
 }

@@ -5,14 +5,14 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
+$GatewayHost = Resolve-MobileHostAddress ''
 $PSNativeCommandUseErrorActionPreference = $false
 . (Join-Path $PSScriptRoot 'resolve-codex-binary.ps1')
 . (Join-Path $PSScriptRoot 'codex-config-fingerprint.ps1')
-. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
 . (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $RuntimeDir = Join-Path $ProjectRoot '.runtime'
-$GatewayHost = Resolve-MobileHostAddress ''
 
 function Get-Listener([int]$Port) {
   Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1

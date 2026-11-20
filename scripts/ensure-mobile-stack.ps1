@@ -8,13 +8,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
+$HostAddress = Resolve-MobileHostAddress $HostAddress
 . (Join-Path $PSScriptRoot "resolve-codex-binary.ps1")
 . (Join-Path $PSScriptRoot "resolve-powershell.ps1")
 . (Join-Path $PSScriptRoot "codex-config-fingerprint.ps1")
-. (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
 . (Join-Path $PSScriptRoot "codex-binary-update.ps1")
+. (Join-Path $PSScriptRoot "get-managed-app-server.ps1")
+. (Join-Path $PSScriptRoot "stack-diagnostics.ps1")
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$HostAddress = Resolve-MobileHostAddress $HostAddress
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
 $LogPath = Join-Path $RuntimeDir "autostart.log"
 $GatewayStdout = Join-Path $RuntimeDir "gateway-host.stdout.log"
@@ -36,8 +38,8 @@ function Get-Listener([int]$Port) {
 
 function Test-GatewayEndpoint([string]$Address, [int]$Port) {
   try {
-    $response = Invoke-WebRequest -Uri "https://${Address}:$Port/" -SkipCertificateCheck -UseBasicParsing -TimeoutSec 3
-    return $response.StatusCode -eq 200 -and [string]$response.Content -match '(?i)Codex.*Console|Codex Mobile'
+    $response = Invoke-RestMethod -Uri "https://${Address}:$Port/api/healthz" -SkipCertificateCheck -TimeoutSec 3
+    return $response.ok -eq $true -and $response.service -eq 'codex-mobile-console'
   } catch { return $false }
 }
 
@@ -55,7 +57,7 @@ function Write-AppServerState($Owner) {
       if ($manifest.sourceDirectory) { $sourceBinary = Join-Path ([string]$manifest.sourceDirectory) 'codex.exe' }
     } catch { }
   }
-  $startedAt = try { ([Management.ManagementDateTimeConverter]::ToDateTime([string]$Owner.CreationDate)).ToUniversalTime().ToString('o') } catch { (Get-Date).ToUniversalTime().ToString('o') }
+  $startedAt = try { ([DateTime]$Owner.CreationDate).ToUniversalTime().ToString('o') } catch { $null }
   $record = [ordered]@{ pid = [int]$Owner.ProcessId; binary = $binaryPath; sourceBinary = [System.IO.Path]::GetFullPath($sourceBinary); listenUrl = $AppServerUrl; startedAt = $startedAt }
   $statePath = Join-Path $RuntimeDir 'shared-app-server.json'
   $tmp = "$statePath.$PID.tmp"
@@ -77,12 +79,9 @@ try {
     throw "共享 app-server 必须监听回环 ws:// 地址。"
   }
 
-  $appListener = Get-Listener -Port $appServerUri.Port
-  if ($appListener) {
-    $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($appListener.OwningProcess)"
-    if ($appListener.LocalAddress -notin @("127.0.0.1", "::1") -or $owner.Name -ine "codex.exe" -or $owner.CommandLine -notmatch "\bapp-server\b") {
-      throw "端口 $($appServerUri.Port) 已被其他程序占用，未启动第二个 app-server。"
-    }
+  try { $owner = Resolve-ManagedAppServerOwner -Port $appServerUri.Port -AllowMissing }
+  catch { throw "4500 仍有监听进程，身份未确认；保留进程和任务。$($_.Exception.Message)" }
+  if ($owner) {
     Assert-CodexBundle -BinaryPath $owner.ExecutablePath
     Write-AppServerState $owner
     Write-AutostartLog "共享 app-server 已运行，PID $($owner.ProcessId)。"
@@ -95,7 +94,7 @@ try {
     }
     $reloadPending = Test-Path -LiteralPath $PendingReloadPath -PathType Leaf
     $startedWithConfigRecord = $configRecord
-    $otherAppServers = Get-CimInstance Win32_Process | Where-Object { $_.Name -ieq "codex.exe" -and $_.CommandLine -match "\bapp-server\b" }
+    $otherAppServers = Get-AppServerCandidateProcesses -Port $appServerUri.Port
     if ($otherAppServers) {
       throw "检测到其他 app-server（PID：$($otherAppServers.ProcessId -join ', ')），未启动第二个实例。"
     }
@@ -197,6 +196,11 @@ try {
   Write-AutostartLog "手机网关已启动，PID $($gatewayListener.OwningProcess)，地址 https://${HostAddress}:$GatewayPort/。"
 } catch {
   Write-AutostartLog "启动检查失败：$($_.Exception.Message)"
+  Write-StackEvent -RuntimeDir $RuntimeDir -Event 'ensure.failed' -Details @{
+    errorType = $_.Exception.GetType().Name
+    appServer = Get-StackPortSnapshot -Port $appServerUri.Port
+    gateway = Get-StackPortSnapshot -Port $GatewayPort
+  }
   throw
 } finally {
   $Mutex.ReleaseMutex()

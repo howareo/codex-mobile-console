@@ -1,9 +1,13 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { mergeThreadPage } from "../web/src/thread-history";
-import { itemDetails, itemImages, itemRole, itemSummary, statusClass, statusText, toolLabel } from "../web/src/thread-items";
+import { itemDetails, itemImages, itemRole, itemSummary, itemType, statusClass, statusText, toolLabel } from "../web/src/thread-items";
 import { formatConversationTime, formatDurationMs, turnDurationMs } from "../web/src/time-format";
-import { interruptErrorText, sendErrorText, turnErrorText } from "../web/src/error-text";
+import { createErrorText, interruptErrorText, sendErrorText, turnErrorText } from "../web/src/error-text";
+import { normalizeThreadCwd, uniqueThreadCwds } from "../src/shared/cwd";
 import { latestPlanFromTurn, parsePlanText, planNotification, planProgress, planSnapshotKey } from "../web/src/plan-state";
+import { parseMarkdownTable } from "../web/src/message-markdown";
+import { THEME_OPTIONS, THEME_STORAGE_KEY, parseThemeMode, readThemeMode, writeThemeMode } from "../web/src/theme";
 import { cacheNamespace, clearClientCaches, clearThreadOverride, mergeThreadMetadata, mergeThreadSummary, pickThreadFields, pollIntervalMs, readClientCache, realtimeThreadId, resumeDecision, shouldReportAuthExpired, writeClientCache, type StorageLike } from "../web/src/pwa-state";
 
 function channel(hex: string): number[] {
@@ -24,6 +28,37 @@ function contrast(first: string, second: string): number {
 }
 
 describe("移动端消息呈现", () => {
+  it("解析 GFM 表格并保留列对齐与转义竖线", () => {
+    const table = parseMarkdownTable([
+      "| 名称 | 数量 | 说明 |",
+      "| :--- | ---: | :---: |",
+      "| **主机** | 2 | Windows \\| EasyTier |",
+      "| 手机 | 1 | `Safari` |"
+    ]);
+    expect(table).toEqual({
+      headers: ["名称", "数量", "说明"],
+      rows: [["**主机**", "2", "Windows \\| EasyTier"], ["手机", "1", "`Safari`"]],
+      align: ["left", "right", "center"]
+    });
+    expect(parseMarkdownTable(["普通文本", "---"])).toBeNull();
+  });
+
+  it("表格滚动限制在消息内，避免手机整页缩放", () => {
+    const css = readFileSync(new URL("../web/src/styles.css", import.meta.url), "utf8");
+    expect(css).toContain("text-size-adjust: 100%");
+    expect(css).toContain(".turn-messages { overflow-x: clip; }");
+    expect(css).not.toContain(".content, .turn-messages { overflow-x: clip; }");
+    expect(css).toContain("input, select, textarea { font-size: 16px; }");
+    expect(css).toContain(".message-markdown:has(.message-table) { display: grid; grid-template-columns: minmax(0, 1fr); width: 100%; min-width: 0; }");
+    expect(css).toContain(".message-table-wrap { min-width: 0; width: 100%; max-width: 100%;");
+    expect(css).toContain("table-layout: fixed");
+  });
+
+  it("Claude 固定输入框只在手机尺寸预留底部空间", () => {
+    const css = readFileSync(new URL("../web/src/styles.css", import.meta.url), "utf8");
+    expect(css).toMatch(/@media \(max-width: 860px\) \{\s*\.claude-layout\.has-selection \{ padding-bottom: 190px; \}\s*\}/);
+  });
+
   it("将文件、命令和思考事件转换为中文折叠摘要", () => {
     const fileChange = { type: "fileChange", id: "file-1", status: "completed", changes: [{ path: "C:\\work\\src\\main.ts", kind: { type: "update" }, diff: "+new\n-old" }] };
     const command = { type: "commandExecution", id: "command-1", status: "failed", command: "npm test", exitCode: 1 };
@@ -55,13 +90,69 @@ describe("移动端消息呈现", () => {
     expect(itemImages({ type: "userMessage", content: [{ type: "text", text: "看图" }, { type: "localImage", path: `C:\\private\\${imageId}` }] })).toEqual([
       { imageId, src: `/api/images/${imageId}` }
     ]);
-    expect(itemImages({ type: "userMessage", content: [{ type: "localImage", path: "C:\\Users\\Public\\photo.png" }] })).toEqual([]);
+    expect(itemImages({ type: "userMessage", content: [{ type: "localImage", path: "C:\\fixtures\\photo.png" }] })).toEqual([]);
   });
 
-  it("保持暗色面层和高对比档的边界对比度", () => {
-    expect(contrast("#5b675e", "#0a0c0b")).toBeGreaterThanOrEqual(3);
-    expect(contrast("#2e3531", "#0a0c0b")).toBeGreaterThanOrEqual(1.5);
-    expect(contrast("#3a423d", "#060807")).toBeGreaterThanOrEqual(1.9);
+  it("把 Codex 回图显示为带认证地址的对话图片", () => {
+    expect(itemType({ type: "ImageView" })).toBe("imageView");
+    expect(itemRole({ type: "imageView", id: "view-1", src: "/api/local-images?t=token.sig" })).toBe("agent");
+    expect(itemImages({ type: "imageView", id: "view-1", src: "/api/local-images?t=token.sig", path: "cat-mascots.png" })).toEqual([
+      { imageId: "view-1", src: "/api/local-images?t=token.sig" }
+    ]);
+    expect(itemImages({ type: "imageGeneration", id: "gen-1", src: "/api/local-images?t=token.sig", savedPath: "out.png" })).toEqual([
+      { imageId: "gen-1", src: "/api/local-images?t=token.sig" }
+    ]);
+    expect(itemImages({ type: "imageView", src: "https://evil.example/x.png" })).toEqual([]);
+    expect(itemRole({ type: "imageView", path: "C:\\secret\\photo.png" })).toBe("tool");
+  });
+
+  it("保持日夜两套主题和高对比档的边界对比度", () => {
+    const css = readFileSync(new URL("../web/src/styles.css", import.meta.url), "utf8");
+    const block = (selector: string): Record<string, string> => {
+      const start = css.indexOf(`${selector} {`);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const body = css.slice(start, css.indexOf("}", start));
+      return Object.fromEntries([...body.matchAll(/(--[\w-]+):\s*([^;]+);/g)].map(match => [match[1]!, match[2]!.trim()]));
+    };
+    const light = block(":root");
+    const dark = block(':root[data-theme="dark"]');
+    const lightContrast = block(".app-shell.high-contrast");
+    const darkContrast = block(':root[data-theme="dark"] .app-shell.high-contrast');
+    // The auto-dark media block must carry the same values as the forced dark theme.
+    const autoDark = css.slice(css.indexOf(':root:not([data-theme="light"]) {'), css.indexOf(':root[data-theme="dark"] {'));
+    for (const [name, value] of Object.entries(dark)) expect(autoDark, name).toContain(`${name}: ${value};`);
+    // Borders of controls: 3:1. Text and status colours: 4.5:1 on the canvas.
+    for (const tokens of [light, dark]) {
+      expect(contrast(tokens["--border-strong"]!, tokens["--canvas"]!)).toBeGreaterThanOrEqual(3);
+      for (const name of ["--text-muted", "--text-secondary", "--accent-text", "--run", "--warn", "--danger", "--danger-ink"]) {
+        expect(contrast(tokens[name]!, tokens["--canvas"]!), name).toBeGreaterThanOrEqual(4.5);
+        expect(contrast(tokens[name]!, tokens["--surface-1"]!), name).toBeGreaterThanOrEqual(4.5);
+      }
+    }
+    expect(contrast(darkContrast["--border-strong"]!, darkContrast["--canvas"]!)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(darkContrast["--text-muted"]!, darkContrast["--canvas"]!)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(lightContrast["--border-strong"]!, lightContrast["--canvas"]!)).toBeGreaterThanOrEqual(4.5);
+    expect(contrast(lightContrast["--text-muted"]!, lightContrast["--surface-3"]!)).toBeGreaterThanOrEqual(4.5);
+    // Spot-check the real dark tokens (previously hard-coded here against the old canvas).
+    expect(dark["--canvas"]).toBe("#06080c");
+    expect(dark["--border-strong"]).toBe("#5a6579");
+    expect(dark["--text-muted"]).toBe("#8b94a7");
+    expect(darkContrast["--border-strong"]).toBe("#7a869b");
+    expect(darkContrast["--canvas"]).toBe("#07080b");
+  });
+
+  it("主题偏好保存在 localStorage，存储不可用时回退到跟随系统", () => {
+    const data = new Map<string, string>();
+    const storage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => void data.set(key, value) };
+    expect(readThemeMode(storage)).toBe("auto");
+    writeThemeMode("dark", storage);
+    expect(data.get(THEME_STORAGE_KEY)).toBe("dark");
+    expect(readThemeMode(storage)).toBe("dark");
+    expect(parseThemeMode("sepia")).toBe("auto");
+    const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); } };
+    expect(readThemeMode(broken)).toBe("auto");
+    expect(() => writeThemeMode("light", broken)).not.toThrow();
+    expect(THEME_OPTIONS.map(option => option.label)).toEqual(["跟随系统", "日间", "夜间"]);
   });
 
   it("合并更早记录并保留实时更新的最近记录", () => {
@@ -98,6 +189,21 @@ describe("移动端消息呈现", () => {
     expect(sendErrorText(new Error("status: 502 token=private-secret"))).not.toContain("private-secret");
   });
 
+  it("规范化 Windows verbatim 路径并去重工作区", () => {
+    const verbatim = "\\\\?\\C:\\projects\\codex";
+    expect(normalizeThreadCwd(verbatim)).toBe("C:\\projects\\codex");
+    expect(normalizeThreadCwd("relative-folder")).toBeNull();
+    expect(uniqueThreadCwds([
+      { cwd: "C:\\projects\\codex" },
+      { cwd: verbatim },
+      { cwd: "C:\\projects\\shop-app" }
+    ])).toEqual([
+      "C:\\projects\\codex",
+      "C:\\projects\\shop-app"
+    ]);
+    expect(createErrorText(new Error("cwd must be an absolute workspace path"))).toContain("绝对路径");
+  });
+
   it("解析实时计划通知并计算当前步骤", () => {
     const snapshot = planNotification({ method: "turn/plan/updated", params: { threadId: "thread-1", turnId: "turn-1", explanation: "按顺序处理", plan: [{ step: "确认边界", status: "completed" }, { step: "实现数据层", status: "inProgress" }, { step: "设计模型", status: "pending" }, { step: "接入界面", status: "pending" }, { step: "执行验证", status: "pending" }, { step: "整理交付", status: "pending" }] } });
     expect(snapshot).toMatchObject({ threadId: "thread-1", turnId: "turn-1", explanation: "按顺序处理" });
@@ -126,14 +232,20 @@ describe("移动端消息呈现", () => {
 
   it("缓存只保留任务元数据并按认证世代隔离", () => {
     const storage = memoryStorage();
-    const origin = "https://private-host.example:4174";
+    const origin = "https://mobile.example.test:4174";
     const session = { ok: true as const, epoch: "epoch-a", expiresAt: Date.now() + 60_000 };
     expect(cacheNamespace(origin, "build-a", "epoch-a")).not.toBe(cacheNamespace(origin, "build-b", "epoch-a"));
     expect(cacheNamespace(origin, "build-a", "epoch-a")).not.toBe(cacheNamespace(origin, "build-a", "epoch-b"));
     expect(pickThreadFields({ id: "thread-1", title: "标题", cwd: "C:\\work", source: { private: true }, extra: "drop" })).toEqual({ id: "thread-1", title: "标题", cwd: "C:\\work" });
 
-    writeClientCache(storage, origin, "build-a", session, [{ id: "thread-1", title: "标题", source: "drop" }], { "thread-1": "草稿" }, { "thread-1": "gpt-5.6-sol" }, { "thread-1": "high" }, "thread-1");
-    expect(readClientCache(storage, origin, "build-a", "epoch-a")).toMatchObject({ threads: [{ id: "thread-1", title: "标题" }], drafts: { "thread-1": "草稿" }, modelOverrides: { "thread-1": "gpt-5.6-sol" }, reasoningOverrides: { "thread-1": "high" } });
+    writeClientCache(storage, origin, "build-a", session, [{ id: "thread-1", title: "标题", source: "drop" }], { "thread-1": "草稿" }, "thread-1");
+    const key = cacheNamespace(origin, "build-a", "epoch-a");
+    expect(readClientCache(storage, origin, "build-a", "epoch-a")).toMatchObject({ threads: [{ id: "thread-1", title: "标题" }], drafts: { "thread-1": "草稿" }, modelOverrides: {}, reasoningOverrides: {} });
+    const oldCache = JSON.parse(storage.getItem(key)!);
+    oldCache.modelOverrides = { "thread-1": "old-model" };
+    oldCache.reasoningOverrides = { "thread-1": "ultra" };
+    storage.setItem(key, JSON.stringify(oldCache));
+    expect(readClientCache(storage, origin, "build-a", "epoch-a")).toMatchObject({ drafts: { "thread-1": "草稿" }, modelOverrides: {}, reasoningOverrides: {} });
     expect(readClientCache(storage, origin, "build-a", "epoch-b")).toBeNull();
     clearClientCaches(storage);
     expect(storage.length).toBe(0);

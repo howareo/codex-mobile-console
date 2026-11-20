@@ -28,7 +28,10 @@ export function itemRecord(item: unknown): ItemRecord {
 
 export function itemType(item: unknown): string {
   const type = itemRecord(item).type;
-  return typeof type === "string" ? type : "unknown";
+  if (typeof type !== "string") return "unknown";
+  if (type === "ImageView") return "imageView";
+  if (type === "ImageGeneration") return "imageGeneration";
+  return type;
 }
 
 export function itemId(item: unknown, fallback: number): string {
@@ -40,6 +43,7 @@ export function itemRole(item: unknown): "user" | "agent" | "tool" | "system" {
   const type = itemType(item);
   if (type.includes("userMessage")) return "user";
   if (type.includes("agentMessage")) return "agent";
+  if ((type === "imageView" || type === "imageGeneration") && itemImages(item).length > 0) return "agent";
   if (SYSTEM_LABELS[type]) return "system";
   return "tool";
 }
@@ -67,15 +71,23 @@ export function itemText(item: unknown): string {
 }
 
 export function itemImages(item: unknown): Array<{ imageId: string; src: string }> {
-  const content = itemRecord(item).content;
-  if (!Array.isArray(content)) return [];
-  return content.flatMap(value => {
+  const object = itemRecord(item);
+  const images: Array<{ imageId: string; src: string }> = [];
+  if (typeof object.src === "string" && isGatewayImageSrc(object.src)) {
+    images.push({ imageId: itemId(item, 0), src: object.src });
+  }
+  if (!Array.isArray(object.content)) return images;
+  return images.concat(object.content.flatMap(value => {
     const input = itemRecord(value);
     if (input.type !== "localImage" || typeof input.path !== "string") return [];
     const imageId = input.path.replaceAll("\\", "/").split("/").at(-1) || "";
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|png|webp|gif)$/i.test(imageId)) return [];
     return [{ imageId, src: `/api/images/${encodeURIComponent(imageId)}` }];
-  });
+  }));
+}
+
+function isGatewayImageSrc(src: string): boolean {
+  return /^\/api\/(?:images\/|local-images(?:\/|\?t=))/.test(src);
 }
 
 // 统一读取 app-server 返回的字符串状态和对象状态。

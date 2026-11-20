@@ -29,6 +29,14 @@ try {
 
   $snapshot = Copy-CodexBundleSnapshot -SourceBinary $fixtureResolved -RuntimeDir $fixtureRuntime
   Assert-CodexBundle -BinaryPath $snapshot
+
+  icacls $snapshot /setintegritylevel L | Out-Null
+  Copy-CodexBundleSnapshot -SourceBinary $fixtureResolved -RuntimeDir $fixtureRuntime | Out-Null
+  $integrityOutput = icacls $snapshot | Out-String
+  if ($integrityOutput -notmatch 'Medium Mandatory Level' -or $integrityOutput -match 'Low Mandatory Level') {
+    throw "快照完整性级别修复失败：应为 Medium 但检测到 Low"
+  }
+
   foreach ($fileName in (Get-CodexBundleFileNames)) {
     $sourceHash = (Get-FileHash -LiteralPath (Join-Path $completeDirectory $fileName) -Algorithm SHA256).Hash
     $snapshotHash = (Get-FileHash -LiteralPath (Join-Path (Split-Path -Parent $snapshot) $fileName) -Algorithm SHA256).Hash

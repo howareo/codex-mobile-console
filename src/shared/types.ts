@@ -95,6 +95,8 @@ export interface ThreadResumeResult extends ThreadReadResult {
   serviceTier?: string | null;
 }
 
+export interface ThreadStartResult extends ThreadReadResult {}
+
 export interface ThreadTurnsListResult {
   data: unknown[];
   nextCursor?: string | null;
@@ -111,6 +113,15 @@ export interface ThreadPageResult {
     hasOlder: boolean;
     loadedOlder?: boolean;
   };
+}
+
+export interface ToolDetailPage {
+  kind: "diff" | "output";
+  text: string;
+  offset: number;
+  nextOffset: number | null;
+  totalCharacters: number;
+  revision: string;
 }
 
 export interface TurnResult {

@@ -197,6 +197,22 @@ function Get-CodexBundleSnapshotPath {
   return Join-Path $snapshotDirectory 'codex.exe'
 }
 
+# 沙盒会将工作区文件标记为 Low 完整性级别；携带 Low 标签的 exe 会以 Low 完整性启动，无法写入 ~/.codex
+function Set-CodexBundleMediumIntegrity {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Directory
+  )
+
+  foreach ($file in (Get-ChildItem -LiteralPath $Directory -Filter *.exe -File)) {
+    icacls $file.FullName /setintegritylevel M | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+      throw "Codex 快照完整性级别修复失败：$($file.Name)"
+    }
+  }
+}
+
 function Copy-CodexBundleSnapshot {
   [CmdletBinding()]
   param(
@@ -246,6 +262,7 @@ function Copy-CodexBundleSnapshot {
     }
   }
 
+  Set-CodexBundleMediumIntegrity -Directory $snapshotDirectory
   Assert-CodexBundle -BinaryPath $snapshotBinary
   if ($copiedFiles.Count -gt 0) {
     $manifest = [ordered]@{

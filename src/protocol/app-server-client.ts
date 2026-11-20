@@ -10,6 +10,7 @@ import type {
   ThreadListResult,
   ThreadReadResult,
   ThreadResumeResult,
+  ThreadStartResult,
   ThreadTurnsListResult,
   ThreadUnsubscribeResult,
   TurnInput,
@@ -17,7 +18,7 @@ import type {
   TurnSteerResult
 } from "../shared/types.js";
 
-const CLIENT_METHODS = new Set(["thread/list", "thread/loaded/list", "thread/read", "thread/resume", "thread/unsubscribe", "thread/turns/list", "model/list", "turn/start", "turn/steer", "turn/interrupt"]);
+const CLIENT_METHODS = new Set(["thread/list", "thread/loaded/list", "thread/read", "thread/resume", "thread/start", "thread/unsubscribe", "thread/turns/list", "model/list", "turn/start", "turn/steer", "turn/interrupt"]);
 
 export type AppServerRequestPriority = "foreground" | "background";
 
@@ -144,6 +145,11 @@ export class AppServerClient extends EventEmitter {
     this.socket = socket;
     try {
       await new Promise<void>((resolve, reject) => {
+        const timeoutMs = this.options.timeoutMs;
+        const timer = setTimeout(() => {
+          cleanup();
+          reject(new Error(`app-server WebSocket open timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
         const onOpen = () => {
           cleanup();
           resolve();
@@ -153,6 +159,7 @@ export class AppServerClient extends EventEmitter {
           reject(error);
         };
         const cleanup = () => {
+          clearTimeout(timer);
           socket.off("open", onOpen);
           socket.off("error", onError);
         };
@@ -182,6 +189,7 @@ export class AppServerClient extends EventEmitter {
       this.emit("connected", { reconnected });
       return result;
     } catch (error) {
+      socket.on("error", () => undefined);
       if (this.socket === socket) this.handleClose(socket, error instanceof Error ? error : new Error(String(error)));
       socket.terminate();
       throw error;
@@ -218,6 +226,11 @@ export class AppServerClient extends EventEmitter {
   // 继续持久化任务前先恢复到共享 app-server；不携带历史，避免大会话重复传输。
   public async resumeThread(threadId: string): Promise<ThreadResumeResult> {
     return this.request<ThreadResumeResult>("thread/resume", { threadId, excludeTurns: true });
+  }
+
+  // 只传绝对 cwd，不注入桌面 MCP/config，避免共享 app-server 再写 Windows verbatim 路径。
+  public async startThread(params: { cwd: string }): Promise<ThreadStartResult> {
+    return this.request<ThreadStartResult>("thread/start", { cwd: params.cwd });
   }
 
   public async unsubscribeThread(threadId: string): Promise<ThreadUnsubscribeResult> {

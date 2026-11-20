@@ -12,6 +12,23 @@ if (!Number.isInteger(timeoutMs) || timeoutMs < 1_000 || timeoutMs > 60_000) {
   throw new Error("--timeout-ms must be between 1000 and 60000");
 }
 
+const hardTimer = setTimeout(() => {
+  console.log(JSON.stringify({
+    ok: false,
+    url,
+    initialize: false,
+    threadList: false,
+    codexHome: null,
+    platformOs: null,
+    threadCount: null,
+    durationMs: timeoutMs,
+    error: `protocol check exceeded ${timeoutMs}ms`
+  }));
+  process.exit(2);
+}, timeoutMs + 1_000);
+hardTimer.unref?.();
+
 const result = await checkAppServerProtocol(url, timeoutMs);
+clearTimeout(hardTimer);
 console.log(JSON.stringify(result));
 if (!result.ok) process.exitCode = 2;

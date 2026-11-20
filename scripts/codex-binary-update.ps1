@@ -108,6 +108,27 @@ function Test-CodexPendingBinarySwitch {
   return $true
 }
 
+function Test-CodexBinarySatisfiesPendingSwitch {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory = $true)]$Record,
+    [Parameter(Mandatory = $true)][string]$BinaryPath
+  )
+
+  if (-not (Test-CodexBundle -BinaryPath $BinaryPath)) { return $false }
+  $resolved = [System.IO.Path]::GetFullPath($BinaryPath)
+  if ($Record.snapshotBinary -and -not [string]::Equals($resolved, [System.IO.Path]::GetFullPath([string]$Record.snapshotBinary), [StringComparison]::OrdinalIgnoreCase)) {
+    return $false
+  }
+  if ($Record.codexSha256 -and (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash -ne [string]$Record.codexSha256) { return $false }
+  if ($Record.bundleSha256 -and (Get-CodexBundleContentFingerprint -BinaryPath $resolved) -ne [string]$Record.bundleSha256) { return $false }
+  if ($Record.version) {
+    $version = Get-CodexBinaryVersion -BinaryPath $resolved
+    if ($version -and $version -ne [string]$Record.version) { return $false }
+  }
+  return $true
+}
+
 function Register-CodexBinaryUpdate {
   [CmdletBinding()]
   param(
@@ -125,6 +146,18 @@ function Register-CodexBinaryUpdate {
   $metadata = Get-CodexBundleMetadata -BinaryPath $InstalledBinary
   $pending = Read-CodexBinaryRecord -Path $pendingPath
   if ($pending -and $pending.sourceFingerprint -eq $metadata.sourceFingerprint -and (Test-CodexPendingBinarySwitch -Record $pending)) {
+    if ($RunningBinary -and (Test-CodexBinarySatisfiesPendingSwitch -Record $pending -BinaryPath $RunningBinary)) {
+      # Keep markers intact; readers ignore satisfied targets without racing writers.
+      $current = [ordered]@{
+        status = 'current'; sourceBinary = $metadata.sourceBinary; sourceFingerprint = $metadata.sourceFingerprint
+        version = if ($pending.version) { [string]$pending.version } else { Get-CodexBinaryVersion -BinaryPath $RunningBinary }
+        codexSha256 = $pending.codexSha256; bundleSha256 = $pending.bundleSha256
+        runningBinary = [System.IO.Path]::GetFullPath($RunningBinary); stableObservations = $StableChecks
+        observedAt = (Get-Date).ToUniversalTime().ToString('o')
+      }
+      Write-CodexBinaryRecord -Path $observationPath -Record $current
+      return [pscustomobject]@{ status = 'current'; record = [pscustomobject]$current; changed = $true }
+    }
     return [pscustomobject]@{ status = 'pending'; record = $pending; changed = $false }
   }
 

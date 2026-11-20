@@ -9,40 +9,47 @@ import {
   Circle,
   CircleCheck,
   Clock3,
-  FilePenLine,
   FolderClosed,
   Gauge,
-  Image,
   ImagePlus,
   LayoutList,
   ListChecks,
   LoaderCircle,
   LogOut,
+  Plus,
   RadioTower,
   RefreshCw,
-  Search,
   Send,
   Settings2,
   ShieldCheck,
   ShieldX,
   Square,
   Terminal,
-  Wrench,
+  TriangleAlert,
   Wifi,
   WifiOff,
   X
 } from "lucide-react";
 import type { ApprovalRequest, InitializeResult, JsonObject, LoadedTasksDiagnosticsResult, ModelListResult, ModelSummary, ReasoningOverrides, RpcNotification, ThreadMetadataResult, ThreadPageResult, ThreadSummary } from "../../src/shared/types";
 import { mergeThreadPage } from "./thread-history";
-import { isConversationItem, itemDetails, itemId, itemImages, itemRecord, itemRole, itemSummary, itemText, itemType, statusClass, statusText, statusValue, toolLabel } from "./thread-items";
+import { itemDetails, itemId, itemRecord, itemRole, itemSummary, itemText, itemType, statusClass, statusText, statusValue, toolLabel } from "./thread-items";
 import { formatConversationTime, formatDurationMs, timestampMs, turnDurationMs } from "./time-format";
 import { clearClientCaches, clearThreadOverride, mergeThreadMetadata, mergeThreadSummary, pollIntervalMs, readClientCache, realtimeThreadId, resumeDecision, shouldReportAuthExpired, writeClientCache, type AuthSessionInfo } from "./pwa-state";
-import { interruptErrorText, sendErrorText, turnErrorText } from "./error-text";
+import { createErrorText, interruptErrorText, sendErrorText, turnErrorText } from "./error-text";
+import { normalizeThreadCwd, uniqueThreadCwds } from "../../src/shared/cwd";
 import { latestPlanFromTurn, planNotification, planProgress, planSnapshotKey, type PlanSnapshot, type PlanStep } from "./plan-state";
 import { MAX_IMAGES_PER_MESSAGE, prepareImageAttachment, releaseImageAttachment, type DraftImage } from "./image-attachments";
+import { ClaudeView } from "./claude-view";
+import { ThreadMessages } from "./thread-messages";
+import { THEME_OPTIONS, applyThemeMode, readThemeMode, syncThemeColor, writeThemeMode, type ThemeMode } from "./theme";
+import { DESKTOP_QUERY, WIDE_QUERY, useMediaQuery } from "./layout";
+import { Inspector } from "./inspector";
+import { CommandPalette, PaletteTrigger, ThreadFilterChips, filterThreads, type ThreadFilter } from "./command-palette";
+import { BrandMark, ClaudeMark, CodexMark, LiveIcon, SettingsIcon } from "./brand-icons";
+import { JumpToLatest, useFollowOutput } from "./follow-output";
 import "./styles.css";
 
-type View = "threads" | "live" | "settings";
+type View = "threads" | "claude" | "live" | "settings";
 type AuthState = "checking" | "signedOut" | "signedIn";
 type DiagnosticLevel = "info" | "warn" | "error";
 type RealtimeState = "open" | "reconnecting" | "polling" | "offline";
@@ -55,7 +62,7 @@ interface ThreadActionState {
   requestId?: string;
   message?: string;
 }
-type TurnBlock = { kind: "item"; item: unknown } | { kind: "activity"; items: unknown[] };
+
 interface DiagnosticsStatus {
   upstream: { state: string; pendingRequests: number };
   realtime: { sockets: number; subscriptions: number; snapshotsRunning: boolean; threadPagesInFlight: number; lastSnapshotAt: string | null; lastSnapshotErrorAt: string | null; mode: string };
@@ -87,7 +94,7 @@ interface ImageUploadResponse {
   mimeType: string;
   size: number;
 }
-const CLIENT_BUILD = "2026.09.05.01";
+const CLIENT_BUILD = "2026.09.27.01";
 const AUTH_EXPIRED_EVENT = "codex-mobile-auth-expired";
 const API_TIMEOUT_MS = 30_000;
 const IMAGE_UPLOAD_TIMEOUT_MS = 60_000;
@@ -159,9 +166,14 @@ function isAbortError(cause: unknown): boolean {
 function App() {
   const [auth, setAuth] = useState<AuthState>("checking");
   const [view, setView] = useState<View>("threads");
+  const [claudeConversationOpen, setClaudeConversationOpen] = useState(false);
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selected, setSelected] = useState<ThreadPageResult | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createCwd, setCreateCwd] = useState("");
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [events, setEvents] = useState<RpcNotification[]>([]);
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([]);
   const [server, setServer] = useState<InitializeResult | null>(null);
@@ -171,6 +183,9 @@ function App() {
   const [syncingThreads, setSyncingThreads] = useState(false);
   const [pageVisibility, setPageVisibility] = useState<DocumentVisibilityState>(document.visibilityState);
   const [highContrast, setHighContrast] = useState(() => window.localStorage.getItem("codex-mobile-high-contrast") === "1");
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [threadFilter, setThreadFilter] = useState<ThreadFilter>("all");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [modelOverrides, setModelOverrides] = useState<Record<string, string>>({});
@@ -283,6 +298,20 @@ function App() {
       document.documentElement.style.removeProperty("--visual-viewport-height");
     };
   }, []);
+
+  useEffect(() => {
+    const query = window.matchMedia("(prefers-color-scheme: dark)");
+    const update = () => syncThemeColor();
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  const changeTheme = (mode: ThemeMode) => {
+    setThemeMode(mode);
+    writeThemeMode(mode);
+    applyThemeMode(mode);
+  };
 
   const toggleContrast = (enabled: boolean) => {
     setHighContrast(enabled);
@@ -455,10 +484,16 @@ function App() {
   useEffect(() => {
     if (auth !== "signedIn" || !session) return;
     const timer = window.setTimeout(() => {
-      writeClientCache(window.localStorage, window.location.origin, CLIENT_BUILD, session, threads, drafts, modelOverrides, reasoningOverrides, selectedId);
+      writeClientCache(window.localStorage, window.location.origin, CLIENT_BUILD, session, threads, drafts, selectedId);
     }, 250);
     return () => window.clearTimeout(timer);
-  }, [auth, session, threads, drafts, modelOverrides, reasoningOverrides, selectedId]);
+  }, [auth, session, threads, drafts, selectedId]);
+
+  useEffect(() => {
+    if (normalizeThreadCwd(createCwd)) return;
+    const next = uniqueThreadCwds(threads)[0];
+    if (next) setCreateCwd(next);
+  }, [threads, createCwd]);
 
   const openThread = (id: string) => {
     if (mobileHistoryEnabled()) {
@@ -479,8 +514,40 @@ function App() {
     window.scrollTo({ top: 0 });
   };
 
+  const openCreateThread = () => {
+    setView("threads");
+    setCreating(true);
+    setCreateError(null);
+    closeThread();
+  };
+
+  const createThread = async (): Promise<void> => {
+    const cwd = normalizeThreadCwd(createCwd);
+    if (!cwd) {
+      setCreateError("请选择已有项目目录，或输入绝对路径");
+      return;
+    }
+    setCreateBusy(true);
+    setCreateError(null);
+    try {
+      const result = await api<{ thread: ThreadSummary }>("/api/threads", { method: "POST", body: JSON.stringify({ cwd }) });
+      setCreating(false);
+      await loadThreads();
+      if (result.thread?.id) openThread(result.thread.id);
+    } catch (cause) {
+      setCreateError(createErrorText(cause));
+    } finally {
+      setCreateBusy(false);
+    }
+  };
+
   useEffect(() => {
     const onPopState = (event: PopStateEvent) => {
+      if (objectValue(event.state)?.codexMobileProvider === "claude") {
+        setView("claude");
+        setSelectedId(null);
+        return;
+      }
       const threadId = objectValue(event.state)?.codexMobileThreadId;
       setView("threads");
       setSelectedId(typeof threadId === "string" ? threadId : null);
@@ -517,7 +584,8 @@ function App() {
   const updateModelOverride = (threadId: string, model: string | null) => {
     setModelOverrides(current => model === null ? clearThreadOverride(current, threadId) : { ...current, [threadId]: model });
     setReasoningOverrides(current => {
-      if (model === null || !Object.prototype.hasOwnProperty.call(current, threadId)) return current;
+      if (model === null) return clearThreadOverride(current, threadId);
+      if (!Object.prototype.hasOwnProperty.call(current, threadId)) return current;
       const options = reasoningOptions(models, model);
       const selected = current[threadId];
       if (options.some(option => option.reasoningEffort === selected)) return current;
@@ -568,7 +636,10 @@ function App() {
         setModelOverrides(current => clearThreadOverride(current, threadId));
         setReasoningOverrides(current => clearThreadOverride(current, threadId));
       }
-      const notice = receipt.mode === "steer" ? "已提交到运行中的任务" : "已提交，任务已经开始";
+      const switched = !activeTurnId && (Object.prototype.hasOwnProperty.call(modelOverrides, threadId) || Object.prototype.hasOwnProperty.call(reasoningOverrides, threadId));
+      const switchNote = switched ? `，已切换为 ${modelDisplayName(models, receipt.model)}${receipt.reasoningEffort ? ` · ${reasoningEffortLabel(receipt.reasoningEffort)}` : ""}` : "";
+      const notice = receipt.mode === "steer" ? "已提交到运行中的任务" : `已提交，任务已经开始${switchNote}`;
+      if (switched) void loadThreadMetadata(threadId);
       setThreadActions(current => ({ ...current, [threadId]: { kind: "send", busy: false, error: null, notice, requestId, message: payloadKey } }));
       window.setTimeout(() => setThreadActions(current => {
         if (current[threadId]?.requestId !== requestId || current[threadId]?.busy || current[threadId]?.error) return current;
@@ -682,6 +753,15 @@ function App() {
           }
           const updatedPlan = planNotification(notification);
           if (updatedPlan && updatedPlan.threadId === selectedIdRef.current) setPlanSnapshots(current => ({ ...current, [planSnapshotKey(updatedPlan.threadId, updatedPlan.turnId)]: updatedPlan }));
+          if (notification.method === "model/rerouted") {
+            const params = objectValue(notification.params);
+            const threadId = typeof params?.threadId === "string" ? params.threadId : null;
+            if (threadId) {
+              const notice = `模型已被自动切换：${modelDisplayName(models, String(params?.fromModel ?? ""))} → ${modelDisplayName(models, String(params?.toModel ?? ""))}`;
+              setThreadActions(current => ({ ...current, [threadId]: { kind: "send", busy: false, error: null, notice } }));
+              void loadThreadMetadata(threadId);
+            }
+          }
           if (notification.method === "thread/snapshot") {
             setRealtimeState("open");
             const snapshot = objectValue(notification.params);
@@ -807,30 +887,33 @@ function App() {
   return (
     <div className={`app-shell ${highContrast ? "high-contrast" : ""}`}>
       <header className="topbar">
-        <div className="brand"><span className="brand-mark">›_</span><div><strong>Codex</strong><span>Mobile Console</span></div></div>
+        <div className="brand"><BrandMark /><div><strong>Codex</strong><span>Mobile Console</span></div></div>
         <div className="topbar-actions">
-          <span className="connection"><span className={`status-dot ${realtimeState === "open" ? "online" : realtimeState}`} />{realtimeStateText(realtimeState)}</span>
-          <button className="icon-button" title="刷新任务" aria-label="刷新任务" onClick={() => { setSyncingThreads(true); void loadThreads(); }}><RefreshCw className={syncingThreads ? "spin" : undefined} size={18} /></button>
+          <span className="connection"><span className={`status-dot ${view === "claude" ? "unknown" : realtimeState === "open" ? "online" : realtimeState}`} />{view === "claude" ? "Claude Code" : realtimeStateText(realtimeState)}</span>
+          {view !== "claude" && <button className="icon-button" title="新建会话" aria-label="新建会话" onClick={openCreateThread}><Plus size={18} /></button>}
+          {view !== "claude" && <button className="icon-button" title="刷新任务" aria-label="刷新任务" onClick={() => { setSyncingThreads(true); void loadThreads(); }}><RefreshCw className={syncingThreads ? "spin" : undefined} size={18} /></button>}
         </div>
       </header>
-      <div className="read-only-strip"><ShieldCheck size={14} /><span>共享控制已启用</span><span className="strip-detail">兼容性验证已通过</span></div>
-      <main className="main-layout">
+      <main className={`main-layout ${view === "threads" && selectedId || view === "claude" && claudeConversationOpen ? "conversation-open" : ""}`}>
         <aside className="sidebar">
           <nav className="nav-list" aria-label="主导航">
-            <NavButton icon={<LayoutList size={18} />} label="任务" active={view === "threads"} onClick={() => { setView("threads"); closeThread(); }} count={threads.length} />
-            <NavButton icon={<RadioTower size={18} />} label="实时" active={view === "live"} onClick={() => setView("live")} count={events.length} />
-            <NavButton icon={<Settings2 size={18} />} label="设置" active={view === "settings"} onClick={() => setView("settings")} />
+            <NavButton icon={<CodexMark />} label="Codex" active={view === "threads"} onClick={() => { setView("threads"); closeThread(); }} count={threads.length} />
+            <NavButton icon={<ClaudeMark />} label="Claude" active={view === "claude"} onClick={() => { setSelectedId(null); window.history.replaceState({ codexMobileProvider: "claude" }, "", window.location.href); setView("claude"); window.scrollTo({ top: 0 }); }} />
+            <NavButton icon={<LiveIcon />} label="实时" active={view === "live"} onClick={() => setView("live")} count={events.length || undefined} />
+            <NavButton icon={<SettingsIcon />} label="设置" active={view === "settings"} onClick={() => setView("settings")} />
           </nav>
-          <div className="sidebar-footer"><span className="platform-chip"><Circle size={8} fill="currentColor" />Windows gateway</span></div>
+          <div className="sidebar-footer"><span className="platform-chip"><Circle size={8} fill="currentColor" />Windows gateway</span><span className="rail-link" title={`4500 共享服务：${realtimeStateText(realtimeState)}`}><span className={`status-dot ${realtimeState === "open" ? "online" : realtimeState}`} />4500</span></div>
         </aside>
-        <section className="content">
-          <ApprovalPanel approvals={approvals} threads={threads} onDecision={decideApproval} />
-            {view === "threads" && <ThreadsView threads={threads} models={models} modelsError={modelsError} modelOverrides={modelOverrides} reasoningOverrides={reasoningOverrides} threadMetadata={threadMetadata} threadMetadataErrors={threadMetadataErrors} planSnapshots={planSnapshots} syncing={syncingThreads} selectedId={selectedId} selected={selected} drafts={drafts} threadActions={threadActions} onSelect={openThread} onBack={closeThread} onLoadOlder={loadOlderTurns} onLoadMetadata={loadThreadMetadata} onDraftChange={updateDraft} onModelChange={updateModelOverride} onReasoningChange={updateReasoningOverride} onSend={sendMessage} onInterrupt={interruptTurn} />}
+        <section className={`content${view === "threads" || view === "claude" ? " content-split" : ""}`}>
+          {view !== "claude" && <ApprovalPanel approvals={approvals} threads={threads} onDecision={decideApproval} />}
+            {view === "threads" && <ThreadsView threads={threads} models={models} modelsError={modelsError} modelOverrides={modelOverrides} reasoningOverrides={reasoningOverrides} threadMetadata={threadMetadata} threadMetadataErrors={threadMetadataErrors} planSnapshots={planSnapshots} syncing={syncingThreads} selectedId={selectedId} selected={selected} drafts={drafts} threadActions={threadActions} listThreads={filterThreads(threads, threadFilter, approvals)} listTools={<><PaletteTrigger onClick={() => setPaletteOpen(true)} /><ThreadFilterChips threads={threads} approvals={approvals} value={threadFilter} onChange={setThreadFilter} /></>} inspector={<Inspector threadId={selectedId} turns={selected?.thread.id === selectedId && Array.isArray(selected?.thread.turns) ? selected.thread.turns : []} threads={threads} approvals={approvals} planSnapshots={planSnapshots} onDecision={decideApproval} request={api} onSelectThread={openThread} />} creating={creating} createCwd={createCwd} createBusy={createBusy} createError={createError} onSelect={openThread} onBack={closeThread} onStartCreate={openCreateThread} onCancelCreate={() => { setCreating(false); setCreateError(null); }} onCreateCwdChange={setCreateCwd} onCreate={() => void createThread()} onLoadOlder={loadOlderTurns} onLoadMetadata={loadThreadMetadata} onDraftChange={updateDraft} onModelChange={updateModelOverride} onReasoningChange={updateReasoningOverride} onSend={sendMessage} onInterrupt={interruptTurn} />}
+           {view === "claude" && <ClaudeView request={api} drafts={drafts} onDraftChange={updateDraft} onConversationChange={setClaudeConversationOpen} />}
            {view === "live" && <LiveView events={events} state={realtimeState} />}
-          {view === "settings" && <SettingsView server={server} highContrast={highContrast} onToggleContrast={toggleContrast} onSignOut={signOut} />}
+          {view === "settings" && <SettingsView server={server} highContrast={highContrast} onToggleContrast={toggleContrast} themeMode={themeMode} onThemeChange={changeTheme} onSignOut={session?.epoch === "local" ? null : signOut} />}
           {error && <div className="error-banner"><WifiOff size={16} />{error}</div>}
         </section>
       </main>
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} threads={threads} approvals={approvals} onSelect={id => { setView("threads"); openThread(id); }} />
     </div>
   );
 }
@@ -857,17 +940,24 @@ function Login({ notice, onSignedIn }: { notice: string | null; onSignedIn: (ses
   return <div className="login-shell"><div className="login-panel"><div className="login-logo">›_</div><p className="eyebrow">CODEX MOBILE CONSOLE</p><h1>连接 Windows 网关</h1><p className="muted">输入一次性配对凭据，凭据不会保存在此设备。</p>{notice && <p className="form-notice">{notice}</p>}<form onSubmit={submit}><label htmlFor="token">配对凭据</label><input id="token" type="password" autoComplete="one-time-code" value={token} onChange={event => setToken(event.target.value)} required disabled={busy} /><button className="primary-button" type="submit" disabled={busy || !token}>{busy ? <LoaderCircle className="spin" size={17} /> : <ChevronRight size={17} />}{busy ? "正在连接" : "建立连接"}</button></form>{error && <p className="form-error">{error}</p>}</div></div>;
 }
 
-function NavButton({ icon, label, active, count, onClick }: { icon: React.ReactNode; label: string; active: boolean; count?: number; onClick: () => void }) {
-  return <button className={`nav-button ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={onClick}>{icon}<span>{label}</span>{count != null && <em>{count}</em>}</button>;
+function NavButton({ icon, label, active, count, onClick }: { icon: React.ReactNode; label: string; active: boolean; count?: number | undefined; onClick: () => void }) {
+  return <button className={`nav-button ${active ? "active" : ""}`} title={label} aria-label={label} aria-current={active ? "page" : undefined} onClick={onClick}>{icon}<span>{label}</span>{count != null && <em>{count}</em>}</button>;
 }
 
-function ThreadsView({ threads, models, modelsError, modelOverrides, reasoningOverrides, threadMetadata, threadMetadataErrors, planSnapshots, syncing, selectedId, selected, drafts, threadActions, onSelect, onBack, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { threads: ThreadSummary[]; models: ModelSummary[]; modelsError: string | null; modelOverrides: Record<string, string>; reasoningOverrides: ReasoningOverrides; threadMetadata: Record<string, ThreadMetadataResult>; threadMetadataErrors: Record<string, string>; planSnapshots: Record<string, PlanSnapshot>; syncing: boolean; selectedId: string | null; selected: ThreadPageResult | null; drafts: Record<string, string>; threadActions: Record<string, ThreadActionState | undefined>; onSelect: (id: string) => void; onBack: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (threadId: string, text: string) => void; onModelChange: (threadId: string, model: string | null) => void; onReasoningChange: (threadId: string, effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void>; }) {
-  const groups = groupThreads(threads);
+function ThreadsView({ threads, listThreads, listTools, inspector, models, modelsError, modelOverrides, reasoningOverrides, threadMetadata, threadMetadataErrors, planSnapshots, syncing, selectedId, selected, drafts, threadActions, creating, createCwd, createBusy, createError, onSelect, onBack, onStartCreate, onCancelCreate, onCreateCwdChange, onCreate, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { threads: ThreadSummary[]; listThreads: ThreadSummary[]; listTools: React.ReactNode; inspector: React.ReactNode; models: ModelSummary[]; modelsError: string | null; modelOverrides: Record<string, string>; reasoningOverrides: ReasoningOverrides; threadMetadata: Record<string, ThreadMetadataResult>; threadMetadataErrors: Record<string, string>; planSnapshots: Record<string, PlanSnapshot>; syncing: boolean; selectedId: string | null; selected: ThreadPageResult | null; drafts: Record<string, string>; threadActions: Record<string, ThreadActionState | undefined>; creating: boolean; createCwd: string; createBusy: boolean; createError: string | null; onSelect: (id: string) => void; onBack: () => void; onStartCreate: () => void; onCancelCreate: () => void; onCreateCwdChange: (cwd: string) => void; onCreate: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (threadId: string, text: string) => void; onModelChange: (threadId: string, model: string | null) => void; onReasoningChange: (threadId: string, effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void>; }) {
+  const desktop = useMediaQuery(DESKTOP_QUERY);
+  const wide = useMediaQuery(WIDE_QUERY);
+  // 桌面端把运行中的任务固定在列表顶部，其余任务仍按项目分组。
+  const liveThreads = desktop ? listThreads.filter(thread => statusClass(thread.status) === "running") : [];
+  const groups = groupThreads(desktop ? listThreads.filter(thread => statusClass(thread.status) !== "running") : listThreads);
   const current = selectedId && selected?.thread.id === selectedId ? selected : null;
   const summary = selectedId ? threads.find(thread => thread.id === selectedId) : undefined;
   return <div className={`threads-layout ${selectedId ? "has-selection" : ""}`}>
     <section className="thread-list">
-      <div className="section-heading"><div><p className="eyebrow">工作区</p><h1>任务</h1></div><span className={`count-label sync-label ${syncing ? "syncing" : ""}`}>{syncing && <LoaderCircle className="spin" size={13} />}{threads.length} 项{syncing ? " · 正在同步" : ""}</span></div>
+      <div className="section-heading"><div><p className="eyebrow">工作区</p><h1>任务</h1></div><div className="list-actions"><button className="secondary-button compact" type="button" onClick={onStartCreate}><Plus size={15} />新建会话</button><span className={`count-label sync-label ${syncing ? "syncing" : ""}`}>{syncing && <LoaderCircle className="spin" size={13} />}{threads.length} 项{syncing ? " · 正在同步" : ""}</span></div></div>
+      <div className="list-tools">{listTools}</div>
+      {creating && <form className="create-thread-panel" onSubmit={event => { event.preventDefault(); onCreate(); }}><label>工作目录<select aria-label="已有项目目录" value={uniqueThreadCwds(threads).includes(createCwd) ? createCwd : ""} onChange={event => onCreateCwdChange(event.target.value)} disabled={createBusy}><option value="">选择已有项目</option>{uniqueThreadCwds(threads).map(cwd => <option value={cwd} key={cwd}>{projectFolder(cwd)} — {cwd}</option>)}</select><input aria-label="绝对工作目录" placeholder="C:\\path\\to\\project" value={createCwd} onChange={event => onCreateCwdChange(event.target.value)} disabled={createBusy} /></label>{createError && <p className="create-thread-error" role="alert">{createError}</p>}<div className="create-thread-actions"><button className="secondary-button compact" type="button" onClick={onCancelCreate} disabled={createBusy}>取消</button><button className="primary-button compact" type="submit" disabled={createBusy || !normalizeThreadCwd(createCwd)}>{createBusy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}{createBusy ? "正在创建" : "创建会话"}</button></div></form>}
+      {liveThreads.length > 0 && <section className="live-section" aria-label="正在运行"><div className="live-section-title">正在运行<span>{liveThreads.length}</span></div>{liveThreads.map(thread => <LiveCard key={thread.id} thread={thread} selected={thread.id === selectedId} read={thread.id === selectedId ? current : null} planSnapshots={planSnapshots} onSelect={onSelect} />)}</section>}
       <div className="thread-groups">{groups.map(group => <section className="thread-group" key={group.name}>
         <div className="thread-group-heading"><FolderClosed size={15} /><strong>{group.name}</strong><span>{group.threads.length}</span></div>
         <div className="thread-items">{group.threads.map(thread => {
@@ -883,7 +973,48 @@ function ThreadsView({ threads, models, modelsError, modelOverrides, reasoningOv
       </section>)}</div>
     </section>
     <section className="thread-detail">{selectedId ? current ? <ThreadDetail read={current} summary={summary} metadata={threadMetadata[selectedId]} metadataError={threadMetadataErrors[selectedId]} models={models} modelsError={modelsError} modelOverride={modelOverrides[selectedId]} reasoningOverride={reasoningOverrides[selectedId]} planSnapshots={planSnapshots} draft={drafts[selectedId] || ""} action={threadActions[selectedId]} onBack={onBack} onLoadOlder={onLoadOlder} onLoadMetadata={onLoadMetadata} onDraftChange={text => onDraftChange(selectedId, text)} onModelChange={model => onModelChange(selectedId, model)} onReasoningChange={effort => onReasoningChange(selectedId, effort)} onSend={onSend} onInterrupt={onInterrupt} /> : <div className="empty-state"><Clock3 size={28} /><p>正在加载聊天记录</p></div> : <div className="empty-state"><LayoutList size={28} /><p>选择一个任务</p></div>}</section>
+    {/* Inspector column (>= 1280px, task open). In scope for a future inspector: selectedId, current (ThreadPageResult), summary, threadMetadata[selectedId], planSnapshots, threadActions[selectedId], models. */}
+    {selectedId && wide && <aside className="inspector-slot">{inspector}</aside>}
   </div>;
+}
+
+function clockText(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds % 60)}` : `${pad(minutes)}:${pad(seconds % 60)}`;
+}
+
+// 运行中任务的置顶卡片。当前步骤、计划进度和已用时间只有已打开的任务才有数据；
+// 其余任务只显示状态和最近更新时间。
+function LiveCard({ thread, selected, read, planSnapshots, onSelect }: { thread: ThreadSummary; selected: boolean; read: ThreadPageResult | null; planSnapshots: Record<string, PlanSnapshot>; onSelect: (id: string) => void }) {
+  const turns = read && Array.isArray(read.thread.turns) ? read.thread.turns : [];
+  const turn = objectValue(turns.at(-1));
+  const turnItems = turn && Array.isArray(turn.items) ? turn.items : [];
+  const turnRunning = turn !== null && statusClass(turn.status) === "running";
+  const startedAt = turn !== null && turnRunning && (typeof turn.startedAt === "number" || typeof turn.startedAt === "string") ? turn.startedAt : null;
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (startedAt == null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  const duration = turn !== null && startedAt != null ? turnDurationMs(turn, now) : null;
+  const lastTool = turnRunning ? turnItems.findLast(item => itemRole(item) === "tool") : undefined;
+  const step = lastTool ? `${toolLabel(lastTool)} · ${itemSummary(lastTool)}` : null;
+  const turnId = turn !== null && typeof turn.id === "string" ? turn.id : null;
+  const plan = turnRunning && turnId ? planSnapshots[planSnapshotKey(thread.id, turnId)]?.plan ?? latestPlanFromTurn(turn) : null;
+  const progress = plan ? planProgress(plan) : null;
+  return <button className={`live-card${selected ? " selected" : ""}`} type="button" aria-current={selected ? "true" : undefined} title={thread.cwd || undefined} onClick={() => onSelect(thread.id)}>
+    <span className="live-card-inner">
+      <span className="live-card-top"><span className="live-agent" aria-hidden="true">›_</span><strong>{thread.name || thread.title || "未命名任务"}</strong>{duration != null && <time className="live-timer">{clockText(duration)}</time>}</span>
+      <span className="live-now"><span className="live-caret" aria-hidden="true" /><span>{step ?? statusText(thread.status)}</span></span>
+      {plan && <span className="live-steps" aria-hidden="true">{plan.map((item, index) => <i className={item.status} key={index} />)}</span>}
+      <span className="live-meta"><span>{projectFolder(thread.cwd)}</span><span>{progress ? `第 ${progress.currentStep} / ${progress.total} 步` : relativeThreadTime(thread.updatedAt ?? thread.createdAt)}</span></span>
+    </span>
+  </button>;
 }
 
 function ThreadDetail({ read, summary, metadata, metadataError, models, modelsError, modelOverride, reasoningOverride, planSnapshots, draft, action, onBack, onLoadOlder, onLoadMetadata, onDraftChange, onModelChange, onReasoningChange, onSend, onInterrupt }: { read: ThreadPageResult; summary?: ThreadSummary | undefined; metadata?: ThreadMetadataResult | undefined; metadataError?: string | undefined; models: ModelSummary[]; modelsError: string | null; modelOverride: string | undefined; reasoningOverride: string | undefined; planSnapshots: Record<string, PlanSnapshot>; draft: string; action: ThreadActionState | undefined; onBack: () => void; onLoadOlder: (threadId: string, cursor: string) => Promise<void>; onLoadMetadata: (threadId: string) => Promise<void>; onDraftChange: (text: string) => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onSend: (threadId: string, text: string, activeTurnId: string | null, images: DraftImage[]) => Promise<boolean>; onInterrupt: (threadId: string, turnId: string) => Promise<void> }) {
@@ -894,21 +1025,9 @@ function ThreadDetail({ read, summary, metadata, metadataError, models, modelsEr
   const needsResume = statusValue(displayThread.status) === "notLoaded";
   const outputVersion = latestOutputVersion(turns);
   const bottomRef = useRef<HTMLDivElement>(null);
-  const followOutput = useRef(true);
+  const follow = useFollowOutput(bottomRef, outputVersion, thread.id);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
-  useEffect(() => {
-    const updateFollow = () => {
-      followOutput.current = document.documentElement.scrollHeight - window.innerHeight - window.scrollY < 180;
-    };
-    window.addEventListener("scroll", updateFollow, { passive: true });
-    requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ block: "end" }));
-    return () => window.removeEventListener("scroll", updateFollow);
-  }, [thread.id]);
-  useEffect(() => {
-    const focused = document.activeElement instanceof HTMLTextAreaElement && document.activeElement.closest(".message-composer");
-    if (followOutput.current && !focused) requestAnimationFrame(() => bottomRef.current?.scrollIntoView({ block: "end" }));
-  }, [outputVersion]);
   const loadOlder = async () => {
     if (!history.hasOlder || !history.olderCursor || loadingOlder) return;
     setLoadingOlder(true);
@@ -926,14 +1045,15 @@ function ThreadDetail({ read, summary, metadata, metadataError, models, modelsEr
     const livePlan = typeof turnId === "string" ? planSnapshots[planSnapshotKey(thread.id, turnId)] : undefined;
     return livePlan && typeof turnId === "string" ? <Turn key={turnId} turn={turn} index={index} plan={livePlan} /> : <Turn key={typeof turnId === "string" ? turnId : index} turn={turn} index={index} />;
   });
-  return <><button className="detail-back" onClick={onBack}><ArrowLeft size={18} /><span>返回任务</span></button><div className="detail-heading"><div><p className="eyebrow">任务</p><h2>{displayThread.name || displayThread.title || "未命名任务"}</h2><span className="detail-meta"><Clock3 size={14} />{displayThread.cwd || "本地工作区"}</span></div><div className="detail-state"><span className="model-summary"><Brain size={14} />{modelLabel(models, modelOverride, displayThread)}</span><span className="reasoning-summary"><Gauge size={14} />{reasoningLabel(models, modelOverride, reasoningOverride, displayThread)}</span><span className={`state-pill ${statusClass(displayThread.status)}`}>{statusText(displayThread.status)}</span></div></div><div className="turn-list">{history.hasOlder && <button className="history-button" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}<span>加载更早记录</span><small>已显示 {turns.length} 轮</small></button>}{historyError && <p className="history-error" role="alert"><CircleAlert size={14} />{historyError}</p>}{turns.length === 0 ? <div className="empty-state compact"><Clock3 size={24} /><p>暂无可见历史</p></div> : turnViews}</div><MessageComposer text={draft} action={action} models={models} modelsError={modelsError} thread={displayThread} metadataError={metadataError} modelOverride={modelOverride} reasoningOverride={reasoningOverride} activeTurnId={activeTurnId} needsResume={needsResume} onOpenSettings={() => onLoadMetadata(thread.id)} onModelChange={onModelChange} onReasoningChange={onReasoningChange} onTextChange={onDraftChange} onSend={(text, images) => onSend(thread.id, text, activeTurnId, images)} onInterrupt={activeTurnId ? () => onInterrupt(thread.id, activeTurnId) : undefined} /><div className="chat-bottom" ref={bottomRef} /></>;
+  return <><button className="detail-back" onClick={onBack}><ArrowLeft size={18} /><span>返回任务</span></button><div className="detail-heading"><div><p className="eyebrow">任务</p><h2>{displayThread.name || displayThread.title || "未命名任务"}</h2><span className="detail-meta"><Clock3 size={14} />{displayThread.cwd || "本地工作区"}</span></div><div className="detail-state"><span className="model-summary"><Brain size={14} />{modelLabel(models, modelOverride, displayThread)}</span><span className="reasoning-summary"><Gauge size={14} />{reasoningLabel(models, modelOverride, reasoningOverride, displayThread)}</span><span className={`state-pill ${statusClass(displayThread.status)}`}>{statusText(displayThread.status)}</span></div></div><div className="turn-list">{history.hasOlder && <button className="history-button" type="button" disabled={loadingOlder} onClick={() => void loadOlder()}>{loadingOlder ? <LoaderCircle className="spin" size={16} /> : <Clock3 size={16} />}<span>加载更早记录</span><small>已显示 {turns.length} 轮</small></button>}{historyError && <p className="history-error" role="alert"><CircleAlert size={14} />{historyError}</p>}{turns.length === 0 ? <div className="empty-state compact"><Clock3 size={24} /><p>暂无可见历史</p></div> : turnViews}</div><MessageComposer text={draft} action={action} models={models} modelsError={modelsError} thread={displayThread} metadataError={metadataError} modelOverride={modelOverride} reasoningOverride={reasoningOverride} activeTurnId={activeTurnId} needsResume={needsResume} onOpenSettings={() => onLoadMetadata(thread.id)} onModelChange={onModelChange} onReasoningChange={onReasoningChange} jumpButton={<JumpToLatest away={follow.away} unseen={follow.unseen} onJump={() => follow.jump()} />} onTextChange={onDraftChange} onSend={(text, images) => { follow.jump(false); return onSend(thread.id, text, activeTurnId, images); }} onInterrupt={activeTurnId ? () => onInterrupt(thread.id, activeTurnId) : undefined} /><div className="chat-bottom" ref={bottomRef} /></>;
 }
 
-function MessageComposer({ text, action, models, modelsError, thread, metadataError, modelOverride, reasoningOverride, activeTurnId, needsResume, onOpenSettings, onModelChange, onReasoningChange, onTextChange, onSend, onInterrupt }: { text: string; action: ThreadActionState | undefined; models: ModelSummary[]; modelsError: string | null; thread: ThreadSummary; metadataError: string | undefined; modelOverride: string | undefined; reasoningOverride: string | undefined; activeTurnId: string | null; needsResume: boolean; onOpenSettings: () => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onTextChange: (text: string) => void; onSend: (text: string, images: DraftImage[]) => Promise<boolean>; onInterrupt: (() => Promise<void>) | undefined }) {
+function MessageComposer({ text, action, models, modelsError, thread, metadataError, modelOverride, reasoningOverride, activeTurnId, needsResume, onOpenSettings, onModelChange, onReasoningChange, onTextChange, onSend, onInterrupt, jumpButton }: { jumpButton?: React.ReactNode; text: string; action: ThreadActionState | undefined; models: ModelSummary[]; modelsError: string | null; thread: ThreadSummary; metadataError: string | undefined; modelOverride: string | undefined; reasoningOverride: string | undefined; activeTurnId: string | null; needsResume: boolean; onOpenSettings: () => void; onModelChange: (model: string | null) => void; onReasoningChange: (effort: string | null) => void; onTextChange: (text: string) => void; onSend: (text: string, images: DraftImage[]) => Promise<boolean>; onInterrupt: (() => Promise<void>) | undefined }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [images, setImages] = useState<DraftImage[]>([]);
   const [imageError, setImageError] = useState<string | null>(null);
   const [preparingImages, setPreparingImages] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imagesRef = useRef<DraftImage[]>([]);
@@ -1020,7 +1140,7 @@ function MessageComposer({ text, action, models, modelsError, thread, metadataEr
     });
     setImageError(null);
   };
-  return <form className="message-composer" onSubmit={submit}>{feedback && <div className={`composer-feedback ${feedbackError ? "error" : actionNotice ? "success" : ""}`} role={feedbackError ? "alert" : "status"}>{feedbackError ? <CircleAlert size={15} /> : busy ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}<span>{feedback}</span></div>}{images.length > 0 && <div className="composer-images" aria-label="待发送图片">{images.map(image => <span className="composer-image" key={image.id}><img src={image.previewUrl} alt={image.name} /><button type="button" title="移除图片" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.id)} disabled={busy}><X size={13} /></button></span>)}</div>}{settingsOpen && <div className="composer-settings">{modelsError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{modelsError}</span></p>}{metadataError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{metadataError}</span></p>}<label className="composer-setting"><span><Brain size={15} />模型</span><select aria-label="模型" value={modelOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || models.length === 0} onChange={event => onModelChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{modelLabel(models, modelOverride, thread)}</option>{models.map(model => <option value={model.id} key={model.id}>{model.displayName}</option>)}</select></label><label className="composer-setting"><span><Gauge size={15} />推理强度</span><select aria-label="推理强度" value={reasoningOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || effortOptions.length === 0} onChange={event => onReasoningChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{reasoningTaskLabel(thread)}</option>{effortOptions.map(option => <option value={option.reasoningEffort} key={option.reasoningEffort}>{reasoningEffortLabel(option.reasoningEffort)}</option>)}</select></label>{activeTurnId && <small>任务运行中</small>}</div>}<textarea ref={textareaRef} aria-label="发送消息" placeholder={activeTurnId ? "向运行中的任务追加消息" : "发送消息"} value={text} onChange={event => updateText(event.target.value)} rows={1} /><div className="composer-actions"><input ref={fileInputRef} className="composer-file-input" type="file" accept="image/*" multiple onChange={event => void selectImages(event.currentTarget.files)} /><button className="composer-button utility" type="button" title="添加图片" aria-label="添加图片" onClick={() => fileInputRef.current?.click()} disabled={busy || images.length >= MAX_IMAGES_PER_MESSAGE}><ImagePlus size={17} /></button><button className={`composer-button utility ${settingsOpen ? "active" : ""}`} type="button" title="模型和推理强度" aria-label="模型和推理强度" aria-expanded={settingsOpen} onClick={toggleSettings} disabled={busy}><Settings2 size={17} /></button>{onInterrupt && <button className="composer-button stop" type="button" title="停止任务" aria-label="停止任务" onClick={() => void interrupt()} disabled={busy}><Square size={16} fill="currentColor" /></button>}<button className="composer-button send" type="submit" title="发送消息" aria-label="发送消息" disabled={busy || (!text.trim() && images.length === 0)}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div></form>;
+  return <form className={`message-composer ${dragOver ? "drag-over" : ""}`} onSubmit={submit} onDragEnter={event => { event.preventDefault(); setDragOver(true); }} onDragOver={event => { event.preventDefault(); setDragOver(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node)) setDragOver(false); }} onDrop={event => { event.preventDefault(); setDragOver(false); void selectImages(event.dataTransfer.files); }}>{jumpButton}{feedback && <div className={`composer-feedback ${feedbackError ? "error" : actionNotice ? "success" : ""}`} role={feedbackError ? "alert" : "status"}>{feedbackError ? <CircleAlert size={15} /> : busy ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}<span>{feedback}</span></div>}{images.length > 0 && <div className="composer-images" aria-label="待发送图片">{images.map(image => <span className="composer-image" key={image.id}><img src={image.previewUrl} alt={image.name} /><button type="button" title="移除图片" aria-label={`移除 ${image.name}`} onClick={() => removeImage(image.id)} disabled={busy}><X size={13} /></button></span>)}</div>}{settingsOpen && <div className="composer-settings">{modelsError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{modelsError}</span></p>}{metadataError && <p className="composer-settings-error" role="alert"><CircleAlert size={15} /><span>{metadataError}</span></p>}<label className="composer-setting"><span><Brain size={15} />模型</span><select aria-label="模型" value={modelOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || models.length === 0} onChange={event => onModelChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{modelLabel(models, modelOverride, thread)}</option>{models.map(model => <option value={model.id} key={model.id}>{model.displayName}</option>)}</select></label><label className="composer-setting"><span><Gauge size={15} />推理强度</span><select aria-label="推理强度" value={reasoningOverride ?? "__task__"} disabled={Boolean(activeTurnId) || busy || effortOptions.length === 0} onChange={event => onReasoningChange(event.target.value === "__task__" ? null : event.target.value)}><option value="__task__">{reasoningTaskLabel(thread)}</option>{effortOptions.map(option => <option value={option.reasoningEffort} key={option.reasoningEffort}>{reasoningEffortLabel(option.reasoningEffort)}</option>)}</select></label>{activeTurnId && <small>任务运行中</small>}</div>}<textarea ref={textareaRef} aria-label="发送消息" placeholder={activeTurnId ? "向运行中的任务追加消息" : "发送消息"} value={text} onChange={event => updateText(event.target.value)} rows={1} /><div className="composer-actions"><label className={`composer-button utility ${busy || images.length >= MAX_IMAGES_PER_MESSAGE ? "disabled" : ""}`} title="添加图片" aria-label="添加图片"><input ref={fileInputRef} className="composer-file-input" type="file" accept="image/*,image/heic,image/heif,.heic,.heif" multiple disabled={busy || images.length >= MAX_IMAGES_PER_MESSAGE} onChange={event => void selectImages(event.currentTarget.files)} /><ImagePlus size={17} /></label><button className={`composer-button utility ${settingsOpen ? "active" : ""}`} type="button" title="模型和推理强度" aria-label="模型和推理强度" aria-expanded={settingsOpen} onClick={toggleSettings} disabled={busy}><Settings2 size={17} /></button>{onInterrupt && <button className="composer-button stop" type="button" title="停止任务" aria-label="停止任务" onClick={() => void interrupt()} disabled={busy}><Square size={16} fill="currentColor" /></button>}<button className="composer-button send" type="submit" title="发送消息" aria-label="发送消息" disabled={busy || (!text.trim() && images.length === 0)}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div></form>;
 }
 
 function ApprovalPanel({ approvals, threads, onDecision }: { approvals: ApprovalRequest[]; threads: ThreadSummary[]; onDecision: (requestId: string | number, decision: "accept" | "decline") => Promise<void> }) {
@@ -1039,7 +1159,7 @@ function ApprovalPanel({ approvals, threads, onDecision }: { approvals: Approval
       setBusyId(null);
     }
   };
-  return <section className="approval-panel"><div className="approval-heading"><div><p className="eyebrow">操作确认</p><h2>待审批</h2></div><span className="count-label">{approvals.length} 项</span></div>{approvals.map(approval => { const thread = threads.find(item => item.id === approvalThreadId(approval)); const id = String(approval.id); const busy = busyId === id; return <article className="approval-item" key={id}><div className="approval-copy"><strong>{approvalTitle(approval.method)}</strong><span>{thread?.name || thread?.title || approvalThreadId(approval) || "当前任务"}</span><code>{approvalSummary(approval.params)}</code>{errors[id] && <span className="approval-error" role="alert"><CircleAlert size={14} />{errors[id]}</span>}</div><div className="approval-actions"><button className="approval-button accept" disabled={busy} onClick={() => void decide(approval, "accept")}><ShieldCheck size={16} />允许一次</button><button className="approval-button decline" disabled={busy} onClick={() => void decide(approval, "decline")}><ShieldX size={16} />拒绝</button></div></article>; })}</section>;
+  return <><div className="approval-scrim" aria-hidden="true" /><section className="approval-panel approval-sheet" aria-label="待审批操作"><div className="approval-grab" aria-hidden="true" /><div className="approval-heading"><span className="approval-warn" aria-hidden="true"><TriangleAlert size={20} /></span><div><p className="eyebrow">操作确认</p><h2>待审批</h2></div><span className="count-label">{approvals.length} 项</span></div>{approvals.map(approval => { const thread = threads.find(item => item.id === approvalThreadId(approval)); const id = String(approval.id); const busy = busyId === id; return <article className="approval-item" key={id}><div className="approval-copy"><strong>{approvalTitle(approval.method)}</strong><span>{thread?.name || thread?.title || approvalThreadId(approval) || "当前任务"}</span><code>{approvalSummary(approval.params)}</code>{errors[id] && <span className="approval-error" role="alert"><CircleAlert size={14} />{errors[id]}</span>}</div><div className="approval-actions"><button className="approval-button accept" disabled={busy} onClick={() => void decide(approval, "accept")}><ShieldCheck size={16} />允许一次</button><button className="approval-button decline" disabled={busy} onClick={() => void decide(approval, "decline")}><ShieldX size={16} />拒绝</button></div></article>; })}</section></>;
 }
 
 function Turn({ turn, index, plan: livePlan }: { turn: unknown; index: number; plan?: PlanSnapshot }) {
@@ -1059,12 +1179,10 @@ function Turn({ turn, index, plan: livePlan }: { turn: unknown; index: number; p
   const durationLabel = duration == null ? "耗时未知" : state === "running" && timestampMs(completedAt) == null ? `处理中 ${formatDurationMs(duration)}` : `耗时 ${formatDurationMs(duration)}`;
   const userTime = timestampMs(startedAt) == null ? null : formatConversationTime(startedAt, now);
   const assistantTime = timestampMs(completedAt) == null ? null : formatConversationTime(completedAt, now);
-  const lastAssistantItem = items.findLast(item => itemRole(item) === "agent");
   const historyPlan = latestPlanFromTurn(turn);
   const plan = livePlan?.plan ?? historyPlan;
-  const blocks = turnBlocks(plan ? items.filter(item => itemType(item) !== "plan") : items);
   const errorMessage = turnErrorText(turn);
-  return <section className="turn"><div className={`turn-label ${state}`}><span>第 {index + 1} 轮</span><span>{formatConversationTime(startedAt, now)}</span><span>{durationLabel}</span>{(state === "failed" || ["interrupted", "cancelled"].includes(status)) && <span>{statusText(object.status)}</span>}</div>{errorMessage && <div className="turn-error" role="alert"><CircleAlert size={16} /><div><strong>任务失败原因</strong><span>{errorMessage}</span></div></div>}{plan && (livePlan?.explanation === undefined ? <PlanCard plan={plan} /> : <PlanCard plan={plan} explanation={livePlan.explanation} />)}<div className="turn-messages">{blocks.map((block, blockIndex) => block.kind === "activity" ? <ActivityGroup items={block.items} active={state === "running"} key={`activity-${itemId(block.items[0], blockIndex)}`} /> : <ThreadItem item={block.item} time={itemRole(block.item) === "user" ? userTime : block.item === lastAssistantItem ? assistantTime : null} key={itemId(block.item, blockIndex)} />)}</div></section>;
+  return <section className="turn"><div className={`turn-label ${state}`}><span>第 {index + 1} 轮</span><span>{formatConversationTime(startedAt, now)}</span><span>{durationLabel}</span>{(state === "failed" || ["interrupted", "cancelled"].includes(status)) && <span>{statusText(object.status)}</span>}</div>{errorMessage && <div className="turn-error" role="alert"><CircleAlert size={16} /><div><strong>任务失败原因</strong><span>{errorMessage}</span></div></div>}{plan && (livePlan?.explanation === undefined ? <PlanCard plan={plan} /> : <PlanCard plan={plan} explanation={livePlan.explanation} />)}<ThreadMessages items={plan ? items.filter(item => itemType(item) !== "plan") : items} active={state === "running"} userTime={userTime} assistantTime={assistantTime} request={api} /></section>;
 }
 
 function PlanCard({ plan, explanation }: { plan: PlanStep[]; explanation?: string | null }) {
@@ -1072,80 +1190,11 @@ function PlanCard({ plan, explanation }: { plan: PlanStep[]; explanation?: strin
   return <section className="plan-card" aria-label={`执行计划，第 ${progress.currentStep} / ${progress.total} 步`}><div className="plan-card-heading"><ListChecks size={17} /><strong>执行计划</strong></div>{explanation && <p className="plan-explanation">{explanation}</p>}<ol className="plan-steps">{plan.map((step, index) => <li className={step.status} key={`${index}-${step.step}`}>{step.status === "completed" ? <CircleCheck aria-hidden="true" size={18} /> : step.status === "inProgress" ? <LoaderCircle className="spin" aria-hidden="true" size={18} /> : <Circle aria-hidden="true" size={18} />}<span>{step.step}</span></li>)}</ol><div className="plan-progress"><span>{progress.completed} 项已完成</span><strong>第 {progress.currentStep} / {progress.total} 步</strong></div></section>;
 }
 
-function ActivityGroup({ items, active }: { items: unknown[]; active: boolean }) {
-  const itemStates = items.map(item => statusClass(itemRecord(item).status ?? itemRecord(item).state));
-  const state = itemStates.includes("failed") ? "failed" : active || itemStates.includes("running") ? "running" : "done";
-  const [open, setOpen] = useState(state === "running" || state === "failed");
-  const detailId = `activity-${itemId(items[0], 0)}`;
-  const labels = [...new Set(items.map(toolLabel))];
-  const summary = `${labels.slice(0, 3).join("、")}${labels.length > 3 ? ` 等 ${labels.length} 类` : ""}`;
-  useEffect(() => {
-    if (state === "running" || state === "failed") setOpen(true);
-  }, [state]);
-  return <section className={`activity-group ${state} ${open ? "open" : "collapsed"}`}>
-    <button className="activity-summary" type="button" aria-expanded={open} aria-controls={detailId} onClick={() => setOpen(value => !value)}>
-      <span className="activity-icon" aria-hidden="true">{state === "running" ? <LoaderCircle className="spin" size={16} /> : state === "failed" ? <CircleAlert size={16} /> : <Wrench size={16} />}</span>
-      <span className="activity-copy"><strong>执行过程</strong><small>{summary}</small></span>
-      <span className="activity-count">{items.length} 项</span><ChevronDown className="tool-chevron" size={16} aria-hidden="true" />
-    </button>
-    {open && <div className="activity-items" id={detailId}>{items.map((item, index) => <ToolCard item={item} key={itemId(item, index)} />)}</div>}
-  </section>;
-}
-
-function ThreadItem({ item, time = null }: { item: unknown; time?: string | null }) {
-  const role = itemRole(item);
-  if (role === "system") return <div className="system-row"><span>{toolLabel(item)}</span></div>;
-  if (isConversationItem(item)) {
-    const text = itemText(item);
-    const images = itemImages(item);
-    return <div className={`message-row ${role}`}><span className="message-avatar">{role === "user" ? "我" : "C"}</span><div className="message-stack"><div className={`message-bubble ${images.length > 0 ? "has-images" : ""}`}>{images.length > 0 && <div className="message-images">{images.map(image => <a href={image.src} target="_blank" rel="noreferrer" key={image.imageId}><img src={image.src} alt="已上传图片" loading="lazy" /></a>)}</div>}{text && <span className="message-text">{text}</span>}{!text && images.length === 0 && "（空消息）"}</div>{time && <time className="message-time">{time}</time>}</div></div>;
-  }
-  return <ToolCard item={item} />;
-}
-
-function ToolCard({ item }: { item: unknown }) {
-  const object = itemRecord(item);
-  const type = itemType(item);
-  const status = object.status ?? object.state;
-  const state = statusClass(status);
-  const statusLabel = statusValue(status) ? statusText(status) : null;
-  const details = itemDetails(item);
-  const [open, setOpen] = useState(state === "running" || state === "failed");
-  const [showAll, setShowAll] = useState(false);
-  const detailId = `item-details-${itemId(item, 0)}`;
-  useEffect(() => {
-    if (state === "failed") setOpen(true);
-  }, [state]);
-  const toggle = (button: HTMLButtonElement) => {
-    const beforeTop = button.getBoundingClientRect().top;
-    setOpen(value => !value);
-    requestAnimationFrame(() => {
-      const delta = button.getBoundingClientRect().top - beforeTop;
-      if (delta) window.scrollBy({ top: delta, behavior: "auto" });
-    });
-  };
-  const icon = type === "fileChange" ? <FilePenLine size={16} /> : type === "commandExecution" ? <Terminal size={16} /> : type === "reasoning" ? <Brain size={16} /> : type === "plan" ? <ListChecks size={16} /> : type === "webSearch" ? <Search size={16} /> : type === "imageView" || type === "imageGeneration" ? <Image size={16} /> : type === "unknown" ? <CircleAlert size={16} /> : <Wrench size={16} />;
-  const visibleDetails = showAll ? details : details.slice(0, 12);
-  return <article className={`tool-card ${state} ${open ? "open" : "collapsed"}`}>
-    <button className={`tool-card-header ${statusLabel ? "has-status" : ""}`} type="button" aria-expanded={open} aria-controls={detailId} onClick={event => toggle(event.currentTarget)}>
-      <span className="tool-icon" aria-hidden="true">{icon}</span>
-      <span className="tool-card-copy"><strong>{toolLabel(item)}</strong><span>{itemSummary(item)}</span></span>
-      {statusLabel && <span className="tool-card-status">{statusLabel}</span>}
-      <ChevronDown className="tool-chevron" size={16} aria-hidden="true" />
-    </button>
-    {open && <div className="tool-card-details" id={detailId}>
-      {visibleDetails.length > 0 ? <div className="tool-detail-lines">{visibleDetails.map((line, index) => <code key={`${itemId(item, 0)}-${index}`}>{line}</code>)}</div> : <span className="tool-empty">暂无详情</span>}
-      {details.length > 12 && <button className="tool-more" type="button" onClick={() => setShowAll(value => !value)}>{showAll ? "收起详情" : `展开全部（${details.length} 行）`}</button>}
-      {type === "unknown" && <code className="tool-raw-type">协议事件：{type}</code>}
-    </div>}
-  </article>;
-}
-
 function LiveView({ events, state }: { events: RpcNotification[]; state: RealtimeState }) {
   return <div className="live-view"><div className="section-heading"><div><p className="eyebrow">事件流</p><h1>实时</h1></div><span className="live-indicator"><Wifi size={15} />{realtimeStateText(state)}</span></div>{events.length === 0 ? <div className="empty-state"><RadioTower size={28} /><p>等待事件</p></div> : <div className="event-list">{events.map((event, index) => <div className="event-row" key={`${event.method}-${index}`}><span className="event-time">{eventTime(event)}</span><div><strong>{eventLabel(event.method)}</strong><small>{event.method}</small></div><code>{eventParamsPreview(event.params)}</code></div>)}</div>}</div>;
 }
 
-function SettingsView({ server, highContrast, onToggleContrast, onSignOut }: { server: InitializeResult | null; highContrast: boolean; onToggleContrast: (enabled: boolean) => void; onSignOut: () => Promise<void> }) {
+function SettingsView({ server, highContrast, onToggleContrast, themeMode, onThemeChange, onSignOut }: { server: InitializeResult | null; highContrast: boolean; onToggleContrast: (enabled: boolean) => void; themeMode: ThemeMode; onThemeChange: (mode: ThemeMode) => void; onSignOut: (() => Promise<void>) | null }) {
   const [diagnostics, setDiagnostics] = useState<DiagnosticsStatus | null>(null);
   const [loadedTasks, setLoadedTasks] = useState<LoadedTasksDiagnosticsResult | null>(null);
   const [loadedTasksError, setLoadedTasksError] = useState(false);
@@ -1191,6 +1240,15 @@ function SettingsView({ server, highContrast, onToggleContrast, onSignOut }: { s
   const stability = diagnostics?.stability;
   return <div className="settings-view">
     <div className="section-heading"><div><p className="eyebrow">本地网关</p><h1>设置</h1></div></div>
+    <div className="settings-subheading"><strong>常用</strong></div>
+    <div className="settings-list">
+      <div className="setting-row"><span>连接状态</span><strong className={diagnostics?.upstream.state === "open" ? "success-text" : "warning-text"}>{upstreamStateText(diagnostics?.upstream.state)}</strong></div>
+      <div className="setting-row"><span>配置应用</span><strong className={diagnostics?.config?.state === "pending" ? "warning-text" : diagnostics?.config?.state === "applied" ? "success-text" : undefined}>{configStateText(diagnostics?.config?.state)}</strong></div>
+      <div className="setting-row theme-row"><span>显示主题</span><div className="theme-switch" role="group" aria-label="显示主题">{THEME_OPTIONS.map(option => <button type="button" key={option.value} aria-pressed={themeMode === option.value} onClick={() => onThemeChange(option.value)}>{option.label}</button>)}</div></div>
+      <div className="setting-row"><span>户外高对比</span><label className="switch-control"><input type="checkbox" aria-label="户外高对比" checked={highContrast} onChange={event => onToggleContrast(event.target.checked)} /><span className="switch-track" aria-hidden="true" /></label></div>
+    </div>
+    {onSignOut && <button className="secondary-button sign-out-button" onClick={() => void onSignOut()}><LogOut size={16} />退出会话</button>}
+    <details className="advanced-settings"><summary><span>高级诊断</span><ChevronDown size={16} /></summary>
     <div className="settings-subheading"><strong>最近 5 分钟</strong><span className={health.className}>{health.label}</span></div>
     <div className="settings-list stability-list">
       <div className="setting-row"><span>请求成功率</span><strong>{metricRate(stability?.upstream.successRate, stability?.upstream.requests)}</strong></div>
@@ -1204,10 +1262,8 @@ function SettingsView({ server, highContrast, onToggleContrast, onSignOut }: { s
     </div>
      <div className="settings-subheading"><strong>当前状态</strong><span>自适应刷新</span></div>
      <div className="settings-list">
-       <div className="setting-row"><span>配置应用</span><strong className={diagnostics?.config?.state === "pending" ? "warning-text" : diagnostics?.config?.state === "applied" ? "success-text" : undefined}>{configStateText(diagnostics?.config?.state)}</strong></div>
        {diagnostics?.config?.state === "pending" && <div className="setting-row"><span>待应用指纹</span><code title={diagnostics.config.pendingFingerprint || undefined}>{shortFingerprint(diagnostics.config.pendingFingerprint)}</code></div>}
        {diagnostics?.config?.requestedAt && <div className="setting-row"><span>变更登记时间</span><strong>{diagnosticTime(diagnostics.config.requestedAt)}</strong></div>}
-      <div className="setting-row"><span>连接状态</span><strong className="success-text">已认证</strong></div>
       <div className="setting-row"><span>上游连接</span><strong className={diagnostics?.upstream.state === "open" ? "success-text" : "warning-text"}>{upstreamStateText(diagnostics?.upstream.state)}</strong></div>
       <div className="setting-row"><span>上游在途请求</span><strong>{diagnostics ? `${diagnostics.upstream.pendingRequests} 个` : "读取中"}</strong></div>
       <div className="setting-row"><span>正在写入任务</span><strong>{diagnostics ? `${diagnostics.writes.activeThreads} 个` : "读取中"}</strong></div>
@@ -1218,13 +1274,12 @@ function SettingsView({ server, highContrast, onToggleContrast, onSignOut }: { s
       <div className="setting-row"><span>最近快照错误</span><strong className={diagnostics?.realtime.lastSnapshotErrorAt ? "warning-text" : "success-text"}>{diagnostics?.realtime.lastSnapshotErrorAt ? diagnosticTime(diagnostics.realtime.lastSnapshotErrorAt) : "无"}</strong></div>
       <div className="setting-row"><span>诊断日志</span><code>{diagnostics?.log.fileName || "gateway.ndjson"}</code></div>
       <div className="setting-row"><span>移动操作</span><strong className="success-text">发送、停止、审批</strong></div>
-      <div className="setting-row"><span>户外高对比</span><label className="switch-control"><input type="checkbox" checked={highContrast} onChange={event => onToggleContrast(event.target.checked)} /><span className="switch-track" aria-hidden="true" /></label></div>
       <div className="setting-row"><span>界面版本</span><code>{CLIENT_BUILD}</code></div>
       <div className="setting-row"><span>运行平台</span><strong>{server?.platformOs || "Windows"}</strong></div>
       <div className="setting-row"><span>Codex Home</span><code>{server?.codexHome || "未返回"}</code></div>
       <div className="setting-row"><span>上游版本</span><code>{server?.userAgent || "未返回"}</code></div>
     </div>
-    <button className="secondary-button" onClick={() => void onSignOut()}><LogOut size={16} />退出会话</button>
+    </details>
   </div>;
 }
 
@@ -1237,33 +1292,18 @@ function approvalSummary(params: JsonObject): string { if (typeof params.command
 function latestOutputVersion(turns: unknown[]): string { const turn = objectValue(turns.at(-1)); const items = Array.isArray(turn?.items) ? turn.items : []; return `${String(turn?.id ?? "")}:${String(turn?.status ?? "")}:${items.map((item, index) => `${itemId(item, index)}:${itemType(item)}:${itemRecord(item).status ?? ""}:${itemText(item).length}:${itemDetails(item).join("\n").length}`).join("|")}`; }
 function groupThreads(threads: ThreadSummary[]): Array<{ name: string; threads: ThreadSummary[] }> { const groups = new Map<string, ThreadSummary[]>(); for (const thread of threads) { const name = projectFolder(thread.cwd); const group = groups.get(name); if (group) group.push(thread); else groups.set(name, [thread]); } return [...groups].map(([name, groupedThreads]) => ({ name, threads: groupedThreads })); }
 function projectFolder(cwd: string | null | undefined): string { if (!cwd) return "其他任务"; const parts = cwd.replaceAll("/", "\\").split("\\").filter(Boolean); const desktopIndex = parts.findIndex(part => part.toLowerCase() === "desktop"); return parts[desktopIndex >= 0 ? desktopIndex + 1 : parts.length - 1] || "其他任务"; }
-function mobileHistoryEnabled(): boolean { return window.matchMedia("(max-width: 860px)").matches || window.matchMedia("(display-mode: standalone)").matches; }
-
-// 将连续工具事件合并为一个执行过程，保留用户和助手消息的主要阅读节奏。
-function turnBlocks(items: unknown[]): TurnBlock[] {
-  const blocks: TurnBlock[] = [];
-  let activity: unknown[] = [];
-  const flush = () => {
-    if (activity.length > 0) blocks.push({ kind: "activity", items: activity });
-    activity = [];
-  };
-  for (const item of items) {
-    if (itemRole(item) === "tool") {
-      activity.push(item);
-      continue;
-    }
-    flush();
-    blocks.push({ kind: "item", item });
-  }
-  flush();
-  return blocks;
-}
+function mobileHistoryEnabled(): boolean { return true; }
 
 // 列表已按项目分组，因此优先显示更新时间和未发送草稿，减少重复路径噪声。
 function threadListMeta(thread: ThreadSummary, hasDraft: boolean): string {
   const parts = [relativeThreadTime(thread.updatedAt ?? thread.createdAt)];
   if (hasDraft) parts.push("有草稿");
   return parts.join(" · ");
+}
+
+function modelDisplayName(models: ModelSummary[], id: string | null | undefined): string {
+  if (!id) return "任务默认模型";
+  return models.find(model => model.id === id || model.model === id)?.displayName ?? id;
 }
 
 function modelLabel(models: ModelSummary[], override: string | undefined, thread?: ThreadSummary): string {
@@ -1362,4 +1402,5 @@ function stabilityHealth(diagnostics: DiagnosticsStatus | null): { label: string
   return { label: "异常", className: "danger-text" };
 }
 
+applyThemeMode(readThemeMode());
 createRoot(document.getElementById("root")!).render(<App />);

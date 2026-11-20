@@ -49,20 +49,25 @@ try {
   Assert-Equal $latestPending.version 'codex-cli 3.0.0' 'pending 未更新为最新稳定版本'
   Write-Output 'PASS: rapid consecutive upgrades retain the last good target until the newest is stable'
 
+  $satisfied = Register-CodexBinaryUpdate -RuntimeDir $runtime -InstalledBinary $newerBinary -RunningBinary $latestPending.snapshotBinary -RunningPid 456 -InstalledVersion 'codex-cli 3.0.0'
+  Assert-Equal $satisfied.status 'current' '运行中的目标快照应使旧 pending 变为 current'
+  if (-not (Test-Path -LiteralPath $pendingPath -PathType Leaf)) { throw '只读目标判定不应删除并发标记。' }
+  Write-Output 'PASS: matching running bundle consumes stale pending without blocking current'
+
   $invalidRecord = [ordered]@{ snapshotBinary = (Join-Path $fixtureRoot 'missing\codex.exe'); codexSha256 = 'BAD' }
   if (Test-CodexPendingBinarySwitch -Record $invalidRecord -Full) { throw '缺失 bundle 被错误接受。' }
   Write-Output 'PASS: incomplete or missing pending bundles are rejected'
 
   $watchSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'watch-mobile-stack.ps1') -Raw
-  foreach ($guard in @('Test-AppServerIdle $AppServerUrl', '$reloadQuietCount -ge $ReloadQuietChecks', 'failed-auto-reload.json', '$versionPending')) {
+  foreach ($guard in @('Get-AppServerIdleSnapshot -Url $AppServerUrl', '$reloadQuietCount -ge $ReloadQuietChecks', '$ReloadRetryCooldownSeconds', 'failed-auto-reload.json', '$versionPending')) {
     if (-not $watchSource.Contains($guard)) { throw "Missing automatic reload guard: $guard" }
   }
   $reloadSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'request-app-server-reload.ps1') -Raw
-  foreach ($required in @('Get-ReloadBlockers', 'pending-app-server-switch.json', 'Get-CodexBinaryVersion', 'Assert-AppServerProtocol', '待处理标记已保留')) {
+  foreach ($required in @('Get-ReloadBlockers', 'pending-app-server-switch.json', 'Get-CodexBinaryVersion', 'Assert-AppServerProtocol', '$healthyNewProcess', '健康进程保持运行')) {
     if (-not $reloadSource.Contains($required)) { throw "维护重载缺少保护：$required" }
   }
   $statusSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'show-autostart-status.ps1') -Raw
-  foreach ($required in @('4500实际版本', '已安装版本', '版本切换', '版本等待原因')) {
+  foreach ($required in @('4500实际版本', '已安装版本', '版本切换', '版本等待原因', '重载等待')) {
     if (-not $statusSource.Contains($required)) { throw "状态输出缺少字段：$required" }
   }
   $ensureSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ensure-mobile-stack.ps1') -Raw
@@ -73,7 +78,8 @@ try {
   if (-not $reloadSource.Contains('Write-CodexBinaryRecord -Path $switchPath -Record $pendingSwitch')) { throw '重载失败时没有恢复版本 pending。' }
   $switchSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'switch-shared-app-server.ps1') -Raw
   if ($switchSource.IndexOf('Set-PreferredCodexBundle', [StringComparison]::Ordinal) -lt $switchSource.IndexOf("if (`$currentOwner", [StringComparison]::Ordinal)) { throw '旧切换入口仍在验证前覆盖首选快照。' }
-  Write-Output 'PASS: automatic switching requires quiet clients and idle tasks; failed target retries are blocked'
+  if ($watchSource.Contains('watchdog-maintenance-grace')) { throw '看门仍包含会打断活动任务的 grace 强制重载。' }
+  Write-Output 'PASS: automatic switching requires quiet clients and explicitly idle tasks; retries are bounded'
 } finally {
   $resolvedFixture = [System.IO.Path]::GetFullPath($fixtureRoot)
   $resolvedTemp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())

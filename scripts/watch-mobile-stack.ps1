@@ -5,25 +5,35 @@ param(
   [string]$AppServerUrl = "ws://127.0.0.1:4500",
   [int]$IntervalSeconds = 30,
   [int]$EnsureTimeoutSeconds = 240,
+  # Must exceed the reload child's own worst case (drain 15 + stop 30 +
+  # ensure 120 + listen 30 + verify, plus rollback readyz 20 + verify) so the
+  # watchdog never kills it mid-rollback.
+  [int]$ReloadTimeoutSeconds = 420,
   [int]$ReloadQuietChecks = 2,
+  [int]$ReloadRetryCooldownSeconds = 300,
+  [int]$ReloadMaxAttempts = 3,
   [switch]$Once
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
+$HostAddress = Resolve-MobileHostAddress $HostAddress
 . (Join-Path $PSScriptRoot "resolve-codex-binary.ps1")
 . (Join-Path $PSScriptRoot "resolve-powershell.ps1")
+. (Join-Path $PSScriptRoot "ensure-claude-backend.ps1")
 . (Join-Path $PSScriptRoot "codex-config-fingerprint.ps1")
-. (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
 . (Join-Path $PSScriptRoot "codex-binary-update.ps1")
 . (Join-Path $PSScriptRoot 'test-app-server-idle.ps1')
+. (Join-Path $PSScriptRoot 'get-managed-app-server.ps1')
+. (Join-Path $PSScriptRoot 'stack-diagnostics.ps1')
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
-$HostAddress = Resolve-MobileHostAddress $HostAddress
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
 $LogPath = Join-Path $RuntimeDir "autostart.log"
 $EnsureScript = Join-Path $PSScriptRoot "ensure-mobile-stack.ps1"
 $ReloadScript = Join-Path $PSScriptRoot "request-app-server-reload.ps1"
 $ConfigStatePath = Join-Path $RuntimeDir "app-server-config-fingerprint.json"
 $PendingReloadPath = Join-Path $RuntimeDir "pending-app-server-reload.json"
+$FailedReloadPath = Join-Path $RuntimeDir 'failed-auto-reload.json'
 $Mutex = [Threading.Mutex]::new($false, "Local\CodexMobileConsoleWatchdog")
 
 if ($IntervalSeconds -lt 10 -or $IntervalSeconds -gt 600) {
@@ -32,8 +42,17 @@ if ($IntervalSeconds -lt 10 -or $IntervalSeconds -gt 600) {
 if ($EnsureTimeoutSeconds -lt 30 -or $EnsureTimeoutSeconds -gt 900) {
   throw "启动检查超时必须在 30 到 900 秒之间。"
 }
+if ($ReloadTimeoutSeconds -lt 300 -or $ReloadTimeoutSeconds -gt 900) {
+  throw "配置重载超时必须在 300 到 900 秒之间。"
+}
 if ($ReloadQuietChecks -lt 2 -or $ReloadQuietChecks -gt 10) {
   throw "配置重载空闲检查次数必须在 2 到 10 次之间。"
+}
+if ($ReloadRetryCooldownSeconds -lt 60 -or $ReloadRetryCooldownSeconds -gt 3600) {
+  throw "自动重载失败冷却必须在 60 到 3600 秒之间。"
+}
+if ($ReloadMaxAttempts -lt 1 -or $ReloadMaxAttempts -gt 10) {
+  throw "同一目标自动重载最大尝试次数必须在 1 到 10 次之间。"
 }
 if (-not (Test-Path -LiteralPath $EnsureScript -PathType Leaf)) {
   throw "缺少启动检查脚本：$EnsureScript"
@@ -50,11 +69,21 @@ function Get-Listener([int]$Port) {
   return Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
 }
 
-function Test-GatewayEndpoint([string]$Address, [int]$Port) {
+function Get-GatewayHealthPayload([string]$Address, [int]$Port) {
   try {
-    $response = Invoke-WebRequest -Uri "https://${Address}:$Port/" -SkipCertificateCheck -UseBasicParsing -TimeoutSec 3
-    return $response.StatusCode -eq 200 -and [string]$response.Content -match '(?i)Codex.*Console|Codex Mobile'
-  } catch { return $false }
+    $response = Invoke-RestMethod -Uri "https://${Address}:$Port/api/healthz" -SkipCertificateCheck -TimeoutSec 3
+    if ($response.ok -eq $true -and $response.service -eq 'codex-mobile-console') { return $response }
+  } catch { }
+  return $null
+}
+
+# Process alive is not the same as usable: report the gateway's own view of
+# its upstream and maintenance gate separately (older gateways omit both).
+function Format-GatewayState($Health) {
+  if (-not $Health) { return '缺失' }
+  if ($Health.maintenance -eq $true) { return '存活-维护中' }
+  if ($Health.upstream -and [string]$Health.upstream -ne 'open') { return "存活-上游未连接($($Health.upstream))" }
+  return '正常'
 }
 
 function Sync-AppServerState($Owner) {
@@ -70,7 +99,7 @@ function Sync-AppServerState($Owner) {
   $statePath = Join-Path $RuntimeDir 'shared-app-server.json'
   $existing = if (Test-Path -LiteralPath $statePath -PathType Leaf) { try { Get-Content -LiteralPath $statePath -Raw -Encoding utf8 | ConvertFrom-Json } catch { $null } } else { $null }
   if ($existing -and [int]$existing.pid -eq [int]$Owner.ProcessId -and [string]::Equals([string]$existing.binary, $binaryPath, [StringComparison]::OrdinalIgnoreCase)) { return }
-  $startedAt = try { ([Management.ManagementDateTimeConverter]::ToDateTime([string]$Owner.CreationDate)).ToUniversalTime().ToString('o') } catch { (Get-Date).ToUniversalTime().ToString('o') }
+  $startedAt = try { ([DateTime]$Owner.CreationDate).ToUniversalTime().ToString('o') } catch { $null }
   $record = [ordered]@{ pid = [int]$Owner.ProcessId; binary = $binaryPath; sourceBinary = [System.IO.Path]::GetFullPath($sourceBinary); listenUrl = $AppServerUrl; startedAt = $startedAt }
   $tmp = "$statePath.$PID.tmp"
   $record | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding utf8
@@ -79,18 +108,20 @@ function Sync-AppServerState($Owner) {
 }
 
 function Test-AppServer([Uri]$Uri) {
-  $listener = Get-Listener -Port $Uri.Port
-  if (-not $listener -or $listener.LocalAddress -notin @("127.0.0.1", "::1")) { return $false }
-  $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
-  if (-not ($owner -and $owner.Name -ieq "codex.exe" -and $owner.CommandLine -match "\bapp-server\b" -and (Test-CodexBundle -BinaryPath $owner.ExecutablePath))) { return $false }
-  try { return (Invoke-WebRequest -Uri "http://127.0.0.1:$($Uri.Port)/readyz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200 } catch { return $false }
+  try {
+    $owner = Resolve-ManagedAppServerOwner -Port $Uri.Port -AllowMissing
+    if (-not $owner) { return $false }
+    if (-not (Test-CodexBundle -BinaryPath $owner.ExecutablePath)) { return $false }
+    return (Invoke-WebRequest -Uri "http://127.0.0.1:$($Uri.Port)/readyz" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200
+  } catch { return $false }
 }
 
-function Test-Gateway([string]$Address, [int]$Port) {
+function Get-GatewayHealth([string]$Address, [int]$Port) {
   $listener = Get-Listener -Port $Port
-  if (-not $listener -or $listener.LocalAddress -ne $Address) { return $false }
+  if (-not $listener -or $listener.LocalAddress -ne $Address) { return $null }
   $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
-  return $owner -and $owner.Name -ieq "node.exe" -and (Test-GatewayEndpoint -Address $Address -Port $Port)
+  if (-not $owner -or $owner.Name -ine "node.exe") { return $null }
+  return Get-GatewayHealthPayload -Address $Address -Port $Port
 }
 
 function Invoke-EnsureWithTimeout([string[]]$Arguments, [int]$TimeoutSeconds) {
@@ -117,18 +148,7 @@ function Invoke-EnsureWithTimeout([string[]]$Arguments, [int]$TimeoutSeconds) {
 }
 
 function Get-ReloadBlockers([Uri]$Uri, [int]$GatewayPort) {
-  $gatewayListener = Get-Listener $GatewayPort
-  $gatewayProcessId = if ($gatewayListener) { [int]$gatewayListener.OwningProcess } else { 0 }
-  $otherClients = @(
-    Get-NetTCPConnection -RemotePort $Uri.Port -State Established -ErrorAction SilentlyContinue |
-      Where-Object { $_.OwningProcess -ne $gatewayProcessId } |
-      Select-Object -ExpandProperty OwningProcess -Unique
-  )
-  $phoneConnections = @(Get-NetTCPConnection -LocalPort $GatewayPort -State Established -ErrorAction SilentlyContinue)
-  $blockers = [System.Collections.Generic.List[string]]::new()
-  if ($otherClients.Count -gt 0) { $blockers.Add("桌面端或其他客户端仍连接 4500（PID：$($otherClients -join ', ')）") }
-  if ($phoneConnections.Count -gt 0) { $blockers.Add("手机端仍连接 $GatewayPort（连接数：$($phoneConnections.Count)）") }
-  return @($blockers)
+  return @((Get-AppServerClientBlockers -AppPort $Uri.Port -GatewayPort $GatewayPort).Messages)
 }
 
 function Invoke-ReloadWithTimeout([string[]]$Arguments, [int]$TimeoutSeconds) {
@@ -165,6 +185,7 @@ $lastHeartbeatAt = Get-Date
 $failureCount = 0
 $reloadQuietCount = 0
 $lastPendingFingerprint = $null
+$lastWaitReason = $null
 $lastBinaryStatus = $null
 
 try {
@@ -175,13 +196,13 @@ try {
     Write-CodexConfigFingerprintRecord $ConfigStatePath $configRecord
     Write-WatchLog "已记录 app-server 配置指纹：$($configRecord.fingerprint)。"
   } elseif ($appliedRecord.fingerprint -ne $configRecord.fingerprint) {
-    $change = Get-CodexConfigChangeKinds $appliedRecord $configRecord
     $existing = Read-CodexConfigFingerprintRecord $PendingReloadPath
     if (-not $existing -or $existing.fingerprint -ne $configRecord.fingerprint) {
       Write-CodexConfigReloadMarker $PendingReloadPath $configRecord 'watchdog-startup' | Out-Null
-      Write-WatchLog "检测到 app-server 配置指纹变化：$($appliedRecord.fingerprint) -> $($configRecord.fingerprint)（provider=$($change.providerChanged), credentials=$($change.credentialsChanged), catalogs=$($change.modelCatalogChanged), instructions=$($change.instructionsChanged), hooks=$($change.hooksChanged), deployment=$($change.deploymentManifestChanged)）。进入安全维护窗口。"
+      Write-WatchLog "检测到 app-server 配置指纹变化：$($appliedRecord.fingerprint) -> $($configRecord.fingerprint)（$(Format-CodexConfigChangeSummary $appliedRecord $configRecord)）。进入安全维护窗口。"
     }
   }
+  $lastObservedRecord = $configRecord
   do {
     try {
       $configRecord = Get-CodexConfigFingerprintRecord
@@ -189,16 +210,20 @@ try {
       if ($appliedRecord -and $appliedRecord.fingerprint -ne $configRecord.fingerprint) {
         $existing = Read-CodexConfigFingerprintRecord $PendingReloadPath
         if (-not $existing -or $existing.fingerprint -ne $configRecord.fingerprint) {
-          $change = Get-CodexConfigChangeKinds $appliedRecord $configRecord
           Write-CodexConfigReloadMarker $PendingReloadPath $configRecord 'watchdog' | Out-Null
-          Write-WatchLog "检测到 app-server 配置指纹变化（provider=$($change.providerChanged), credentials=$($change.credentialsChanged), catalogs=$($change.modelCatalogChanged), instructions=$($change.instructionsChanged), hooks=$($change.hooksChanged), deployment=$($change.deploymentManifestChanged)）。已登记最新稳定配置。"
+          $baseline = if ($lastObservedRecord -and $lastObservedRecord.fingerprint -ne $configRecord.fingerprint) { $lastObservedRecord }
+            elseif ($existing -and $existing.configKeyDigests) { $existing }
+            else { $appliedRecord }
+          Write-WatchLog "检测到 app-server 配置指纹变化（$(Format-CodexConfigChangeSummary $baseline $configRecord)）。已登记最新稳定配置。"
         }
       }
+      $lastObservedRecord = $configRecord
       $appServerHealthy = Test-AppServer -Uri $appServerUri
-      $gatewayHealthy = Test-Gateway -Address $HostAddress -Port $GatewayPort
+      $gatewayHealth = Get-GatewayHealth -Address $HostAddress -Port $GatewayPort
+      $gatewayHealthy = [bool]$gatewayHealth
+      try { Ensure-ClaudeBackend -ProjectRoot $ProjectRoot } catch { Write-WatchLog "Claude 只读服务异常（Codex 不受影响）：$($_.Exception.Message)" }
       if ($appServerHealthy) {
-        $appListener = Get-Listener -Port $appServerUri.Port
-        $appOwner = if ($appListener) { Get-CimInstance Win32_Process -Filter "ProcessId=$($appListener.OwningProcess)" -ErrorAction SilentlyContinue } else { $null }
+        try { $appOwner = Resolve-ManagedAppServerOwner -Port $appServerUri.Port -AllowMissing } catch { $appOwner = $null }
         if ($appOwner) {
           Sync-AppServerState $appOwner
           $installedBinary = Resolve-InstalledCodexBinary
@@ -210,13 +235,50 @@ try {
               'changed-during-copy' { Write-WatchLog 'Codex 安装程序在快照期间仍有变化，放弃本次候选并重新观察。' }
               'staged' { Write-WatchLog "Codex 新版本已验证并预存：$($binaryUpdate.record.version)。当前 PID $($appOwner.ProcessId) 保持运行，等待用户维护窗口重载。" }
             }
+            Write-StackEvent -RuntimeDir $RuntimeDir -Event 'upgrade.candidate' -Details @{
+              status = $binaryUpdate.status
+              version = $binaryUpdate.record.version
+              stableObservations = $binaryUpdate.record.stableObservations
+              runningPid = [int]$appOwner.ProcessId
+            }
             $lastBinaryStatus = $binaryStatus
           }
         }
       }
-      $state = "app-server=" + $(if ($appServerHealthy) { "正常" } else { "缺失" }) + ", gateway=" + $(if ($gatewayHealthy) { "正常" } else { "缺失" })
+      $state = "app-server=" + $(if ($appServerHealthy) { "正常" } else { "缺失" }) + ", gateway=" + (Format-GatewayState $gatewayHealth)
+      $versionPending = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'pending-app-server-switch.json')
+      if ($versionPending -and $appOwner -and (Test-CodexBinarySatisfiesPendingSwitch -Record $versionPending -BinaryPath ([string]$appOwner.ExecutablePath))) { $versionPending = $null }
+      $pendingRecord = Read-CodexConfigFingerprintRecord $PendingReloadPath
+      $configMarkerSatisfied = Test-CodexConfigReloadMarkerSatisfied -Marker $pendingRecord -Applied $appliedRecord -Current $configRecord
+      $pendingExists = (($pendingRecord -and -not $configMarkerSatisfied) -or $versionPending)
+      if ($pendingExists -and $appServerHealthy) {
+        $reloadKeyForStatus = "$($configRecord.fingerprint):$($versionPending.codexSha256)"
+        $failureForStatus = Read-AppServerReloadFailure -Path $FailedReloadPath
+        $ownerStartedAt = if ($appOwner) { [string]$appOwner.CreationDate } else { $null }
+        $waitReason = Get-AppServerReloadWaitReason -AppPort $appServerUri.Port -GatewayPort $GatewayPort -ListenUrl $AppServerUrl -Failure $failureForStatus -TargetKey $reloadKeyForStatus -CurrentProcessId $(if ($appOwner) { [int]$appOwner.ProcessId } else { 0 }) -CurrentProcessStartedAt $ownerStartedAt -RetryCooldownSeconds $ReloadRetryCooldownSeconds -RetryMaxAttempts $ReloadMaxAttempts
+        if ($waitReason -ne $lastWaitReason) {
+          Write-WatchLog "待重载等待：$waitReason"
+          Write-StackEvent -RuntimeDir $RuntimeDir -Event 'reload.waiting' -Details @{
+            reason = $waitReason
+            runningPid = if ($appOwner) { [int]$appOwner.ProcessId } else { 0 }
+            configFingerprint = $configRecord.fingerprint
+            targetVersion = [string]$versionPending.version
+          }
+          $lastWaitReason = $waitReason
+        }
+      } else {
+        $lastWaitReason = $null
+      }
       if ($state -ne $lastState) {
         Write-WatchLog "链路状态：$state。"
+        Write-StackEvent -RuntimeDir $RuntimeDir -Event 'stack.state-changed' -Details @{
+          appServerHealthy = [bool]$appServerHealthy
+          gatewayHealthy = [bool]$gatewayHealthy
+          gatewayUpstream = if ($gatewayHealth) { [string]$gatewayHealth.upstream } else { $null }
+          gatewayMaintenance = if ($gatewayHealth) { $gatewayHealth.maintenance -eq $true } else { $null }
+          appServer = if ($appServerHealthy) { $null } else { Get-StackPortSnapshot -Port $appServerUri.Port }
+          gateway = if ($gatewayHealthy) { $null } else { Get-StackPortSnapshot -Port $GatewayPort }
+        }
         $lastState = $state
         $lastHeartbeatAt = Get-Date
       } elseif (((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge 300) {
@@ -237,37 +299,52 @@ try {
         if ($exitCode -ne 0) { throw "启动检查退出码：$exitCode" }
       }
 
-      $versionPending = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'pending-app-server-switch.json')
-      if (-not $Once -and ((Test-Path -LiteralPath $PendingReloadPath -PathType Leaf) -or $versionPending) -and $appServerHealthy) {
+      if (-not $Once -and $pendingExists -and $appServerHealthy) {
         $pending = Read-CodexConfigFingerprintRecord $PendingReloadPath
         $reloadKey = "$($configRecord.fingerprint):$($versionPending.codexSha256)"
-        $failed = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'failed-auto-reload.json')
+        $failed = Read-AppServerReloadFailure -Path $FailedReloadPath
+        $ownerStartedAt = if ($appOwner) { [string]$appOwner.CreationDate } else { $null }
+        $retry = Get-AppServerReloadRetryDecision -Failure $failed -TargetKey $reloadKey -CurrentProcessId $(if ($appOwner) { [int]$appOwner.ProcessId } else { 0 }) -CurrentProcessStartedAt $ownerStartedAt -CooldownSeconds $ReloadRetryCooldownSeconds -MaxAttempts $ReloadMaxAttempts
         $candidate = Read-CodexBinaryRecord (Join-Path $RuntimeDir 'installed-app-server-candidate.json')
         $versionStable = -not $versionPending -or ($candidate.status -eq 'pending' -and $candidate.sourceFingerprint -eq $versionPending.sourceFingerprint)
-        if ($versionStable -and (-not $pending -or $pending.fingerprint -eq $configRecord.fingerprint) -and (-not $failed -or $failed.key -ne $reloadKey)) {
+        if ($versionStable -and (-not $pending -or $pending.fingerprint -eq $configRecord.fingerprint) -and $retry.Allowed) {
           if ($lastPendingFingerprint -ne $reloadKey) {
             $lastPendingFingerprint = $reloadKey
             $reloadQuietCount = 0
           }
           $blockers = @(Get-ReloadBlockers ([Uri]$AppServerUrl) $GatewayPort)
-          if ($blockers.Count -eq 0 -and (Test-AppServerIdle $AppServerUrl)) {
-            $reloadQuietCount++
+          if ($blockers.Count -eq 0) {
+            $idle = Get-AppServerIdleSnapshot -Url $AppServerUrl
+            if (-not $idle.error -and $idle.idle -and $idle.unknownCount -eq 0) { $reloadQuietCount++ } else { $reloadQuietCount = 0 }
             if ($reloadQuietCount -ge $ReloadQuietChecks) {
-              Write-WatchLog "配置指纹 $($pending.fingerprint) 已稳定且连续 $reloadQuietCount 个检查周期无客户端连接，开始受控自动重载。"
+              $label = if ($pending -and $pending.fingerprint) { "配置 $($pending.fingerprint)" } elseif ($versionPending) { "版本 $($versionPending.version)" } else { '待重载目标' }
+              Write-WatchLog "$label 已稳定且连续 $reloadQuietCount 个检查周期无客户端连接、任务明确空闲，开始受控自动重载。"
               $reloadArguments = @(
                 "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                 "-File", $ReloadScript,
                 "-Apply", "-Confirmation", "RELOAD_SHARED_APP_SERVER",
-                "-Reason", "watchdog-maintenance",
+                "-Reason", 'watchdog-maintenance',
                 "-HostAddress", $HostAddress, "-GatewayPort", [string]$GatewayPort, "-ListenUrl", $AppServerUrl
               )
-              $reloadExit = Invoke-ReloadWithTimeout -Arguments $reloadArguments -TimeoutSeconds $EnsureTimeoutSeconds
+              $failureBeforeReload = Read-AppServerReloadFailure -Path $FailedReloadPath
+              $reloadExit = Invoke-ReloadWithTimeout -Arguments $reloadArguments -TimeoutSeconds $ReloadTimeoutSeconds
+              Write-StackEvent -RuntimeDir $RuntimeDir -Event 'reload.watchdog-result' -Details @{ exitCode = $reloadExit; previousPid = if ($appOwner) { [int]$appOwner.ProcessId } else { 0 } }
               if ($reloadExit -ne 0) {
-                Write-CodexBinaryRecord (Join-Path $RuntimeDir 'failed-auto-reload.json') @{ key = $reloadKey; exitCode = $reloadExit }
-                throw "自动重载失败，暂停同一目标的自动重试：$reloadExit"
+                $failure = Read-AppServerReloadFailure -Path $FailedReloadPath
+                $childRecordedFailure = $failure -and $failure.targetKey -eq $reloadKey -and (
+                  -not $failureBeforeReload -or
+                  $failureBeforeReload.targetKey -ne $reloadKey -or
+                  [int]$failure.attempts -gt [int]$failureBeforeReload.attempts -or
+                  -not [string]::Equals([string]$failure.failedAt, [string]$failureBeforeReload.failedAt, [StringComparison]::Ordinal)
+                )
+                if (-not $childRecordedFailure) {
+                  $failure = Write-AppServerReloadFailure -Path $FailedReloadPath -TargetKey $reloadKey -Stage 'reload-child' -ExitCode $reloadExit -Message "重载子进程退出码 $reloadExit" -SourceProcessId $(if ($appOwner) { [int]$appOwner.ProcessId } else { 0 }) -SourceProcessStartedAt $ownerStartedAt -TargetVersion ([string]$versionPending.version) -TargetSha256 ([string]$versionPending.codexSha256)
+                }
+                throw "自动重载失败（第 $($failure.attempts)/$ReloadMaxAttempts 次），进入冷却后再评估：$reloadExit"
               }
               $reloadQuietCount = 0
               $lastPendingFingerprint = $null
+              $lastWaitReason = $null
             }
           } else {
             if ($reloadQuietCount -gt 0) { Write-WatchLog "配置自动重载暂停：$($blockers -join '；')。" }

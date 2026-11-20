@@ -1,9 +1,18 @@
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type ProxyOptions } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+
+// Dev preview against a running gateway, e.g. CODEX_MOBILE_DEV_GATEWAY=https://127.0.0.1:4174.
+// The gateway rejects cross-site Origin on writes and /api/events, so present the gateway's own origin.
+const gateway = process.env.CODEX_MOBILE_DEV_GATEWAY || "http://127.0.0.1:4174";
+const sameOrigin: ProxyOptions["configure"] = proxy => {
+  proxy.on("proxyReq", req => req.setHeader("origin", gateway));
+  proxy.on("proxyReqWs", req => req.setHeader("origin", gateway));
+};
 
 export default defineConfig({
   root: "web",
+  ...(process.env.CODEX_MOBILE_VITE_CACHE ? { cacheDir: process.env.CODEX_MOBILE_VITE_CACHE } : {}),
   plugins: [
     react(),
     VitePWA({
@@ -31,7 +40,7 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": "http://127.0.0.1:4174"
+      "/api": { target: gateway, changeOrigin: true, secure: false, ws: true, configure: sameOrigin }
     }
   }
 });

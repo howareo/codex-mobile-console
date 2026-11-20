@@ -5,4 +5,5 @@ evidence/*
 !evidence/.gitkeep
 *.local
 *.log
+__pycache__/
 .DS_Store

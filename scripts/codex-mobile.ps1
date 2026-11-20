@@ -1,16 +1,17 @@
 [CmdletBinding()]
 param(
-  [ValidateSet('help', 'status', 'diagnose', 'check-4500', 'start-4500', 'stop-4500', 'restart-4500', 'start', 'stop', 'restart', 'reload', 'install', 'uninstall', 'stop-gateway', 'restart-gateway')]
+  [ValidateSet('help', 'status', 'diagnose', 'check-4500', 'start-4500', 'stop-4500', 'restart-4500', 'start', 'stop', 'restart', 'reload', 'install', 'uninstall', 'stop-gateway', 'restart-gateway', 'claude-status', 'start-claude', 'stop-claude')]
   [string]$Action = 'help',
   [switch]$Apply,
-  [string]$Confirmation
+  [string]$Confirmation,
+  [switch]$Wait,
+  [int]$WaitSeconds = 180
 )
 
 $ErrorActionPreference = 'Stop'
-$ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$HostResolver = Join-Path $PSScriptRoot 'resolve-mobile-host.ps1'
-. $HostResolver
+. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
 $GatewayHost = Resolve-MobileHostAddress ''
+$ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $TaskName = 'Codex Mobile Console'
 $Pwsh = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
 if ([string]::IsNullOrWhiteSpace($Pwsh)) { $Pwsh = (Get-Command powershell.exe -ErrorAction Stop).Source }
@@ -44,7 +45,7 @@ Codex 手机控制台统一管理入口
   .\scripts\codex-mobile.ps1 stop-4500
   .\scripts\codex-mobile.ps1 stop-4500 -Apply -Confirmation STOP_SHARED_APP_SERVER
   .\scripts\codex-mobile.ps1 restart-4500
-  .\scripts\codex-mobile.ps1 restart-4500 -Apply -Confirmation RELOAD_SHARED_APP_SERVER
+  .\scripts\codex-mobile.ps1 restart-4500 -Wait -Apply -Confirmation RELOAD_SHARED_APP_SERVER
 
 日常启动/停止：
   .\scripts\codex-mobile.ps1 start        启动看门；不会重复启动 4500
@@ -68,7 +69,7 @@ Codex 手机控制台统一管理入口
   npm run build
   .\scripts\codex-mobile.ps1 restart
 
-升级后看门会连续确认完整安装 bundle 并预存快照，但不会打断正在使用的 4500。status 显示“版本切换待处理”时，关闭 Codex Desktop 和手机页面，先预览 restart-4500，再执行带确认词的维护重载。不要编辑 state_5.sqlite，不要手动启动第二个 4500。
+升级后看门会预存新版本，桌面开着时不会重载 4500。推荐先运行 restart-4500 -Wait -Apply -Confirmation RELOAD_SHARED_APP_SERVER，再关 Codex Desktop 和手机页面。确认词也可以写成 RESTART_4500。不要编辑 state_5.sqlite，不要手动启动第二个 4500。
 '@
 }
 
@@ -98,6 +99,7 @@ switch ($Action) {
   }
   'restart-4500' {
     $args = @('-Reason', 'manual-restart')
+    if ($Wait) { $args += @('-Wait', '-WaitSeconds', ([string]$WaitSeconds)) }
     if ($Apply) { $args += @('-Apply', '-Confirmation', $Confirmation) }
     Run-Script 'request-app-server-reload.ps1' $args
     break
@@ -120,11 +122,12 @@ switch ($Action) {
     if (-not $task) { throw '未安装登录自启动，不能重启看门。' }
     if ($task.State -eq 'Running') { Stop-ScheduledTask -TaskName $TaskName; Start-Sleep -Seconds 1 }
     Start-ScheduledTask -TaskName $TaskName
-    Write-Output '看门已重启；不会主动重启 4500。'
+    Write-Output '看门已重启；若有待处理变更，会在客户端断开且任务明确空闲后受控重载 4500。'
     break
   }
   'reload' {
     $args = @()
+    if ($Wait) { $args += @('-Wait', '-WaitSeconds', ([string]$WaitSeconds)) }
     if ($Apply) { $args += @('-Apply', '-Confirmation', $Confirmation) }
     Run-Script 'request-app-server-reload.ps1' $args
     break
@@ -137,12 +140,15 @@ switch ($Action) {
     Run-Script 'uninstall-autostart.ps1' @('-Apply', '-Confirmation', $(if ($Confirmation) { $Confirmation } else { '' }))
     break
   }
+  'claude-status' { Run-Script 'claude-backend.ps1' @('-Action', 'status'); break }
+  'start-claude' { Run-Script 'claude-backend.ps1' @('-Action', 'start'); break }
+  'stop-claude' { Run-Script 'claude-backend.ps1' @('-Action', 'stop'); break }
   'stop-gateway' {
     Require-Confirmation 'STOP_MOBILE_GATEWAY'
     $listener = Get-NetTCPConnection -LocalPort 4174 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $listener) { Write-Output '4174 当前没有监听进程。'; break }
-    try { $page = Invoke-WebRequest -Uri "https://${GatewayHost}:4174/" -SkipCertificateCheck -UseBasicParsing -TimeoutSec 3 } catch { throw '4174 不是可验证的手机网关，未停止任何进程。' }
-    if ($page.StatusCode -ne 200 -or [string]$page.Content -notmatch '(?i)Codex.*Console|Codex Mobile') { throw '4174 身份校验失败，未停止任何进程。' }
+    try { $health = Invoke-RestMethod -Uri "https://${GatewayHost}:4174/api/healthz" -SkipCertificateCheck -TimeoutSec 3 } catch { throw '4174 不是可验证的手机网关，未停止任何进程。' }
+    if ($health.ok -ne $true -or $health.service -ne 'codex-mobile-console') { throw '4174 身份校验失败，未停止任何进程。' }
     $owner = Get-Process -Id $listener.OwningProcess -ErrorAction Stop
     if ($owner.ProcessName -ine 'node') { throw '4174 不是 Node 网关进程，未停止任何进程。' }
     Stop-Process -Id $owner.Id -Force

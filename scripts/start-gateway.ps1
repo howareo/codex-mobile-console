@@ -7,7 +7,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-. (Join-Path $PSScriptRoot "resolve-mobile-host.ps1")
+. (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
 $HostAddress = Resolve-MobileHostAddress $HostAddress
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeDir = Join-Path $ProjectRoot ".runtime"
@@ -36,6 +36,8 @@ $env:CODEX_MOBILE_TLS_CERT = $TlsCertificate
 $env:CODEX_MOBILE_TLS_KEY = $TlsKey
 $env:CODEX_MOBILE_LOG_FILE = $LogFile
 $env:CODEX_MOBILE_SESSION_STORE_FILE = $SessionStoreFile
+# 公开部署默认要求使用配对密钥验证。
+$env:CODEX_MOBILE_AUTH_REQUIRED = "1"
 
 Write-Host "手机网关：https://${HostAddress}:$Port/"
 Write-Host "诊断日志：$LogFile"

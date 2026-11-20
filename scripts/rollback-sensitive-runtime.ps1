@@ -10,9 +10,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-. (Join-Path $PSScriptRoot 'resolve-powershell.ps1')
 . (Join-Path $PSScriptRoot 'resolve-mobile-host.ps1')
 $HostAddress = Resolve-MobileHostAddress $HostAddress
+. (Join-Path $PSScriptRoot 'resolve-powershell.ps1')
 $projectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $resolvedRuntime = [System.IO.Path]::GetFullPath($RuntimeDir)
 $privateRoot = Join-Path $resolvedRuntime 'private'

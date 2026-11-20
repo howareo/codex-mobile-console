@@ -51,7 +51,7 @@ export class SessionStore {
   private readonly onError: NonNullable<SessionStoreOptions["onError"]>;
   private dirty = false;
   private writeTimer: NodeJS.Timeout | null = null;
-  private writePromise: Promise<void> = Promise.resolve();
+  private flushPromise: Promise<void> | null = null;
 
   private constructor(options: SessionStoreOptions) {
     this.ttlMs = options.ttlMs;
@@ -114,20 +114,29 @@ export class SessionStore {
     if (id && this.sessions.delete(this.digest(id))) this.markDirty();
   }
 
-  public async flush(): Promise<void> {
+  public flush(): Promise<void> {
     if (this.writeTimer) {
       clearTimeout(this.writeTimer);
       this.writeTimer = null;
     }
-    while (this.filePath && this.dirty) {
-      this.dirty = false;
-      const snapshot = this.snapshot();
-      this.writePromise = this.writePromise.then(() => this.persist(snapshot)).catch(error => {
-        this.onError("sessions.write_failed", error);
-      });
-      await this.writePromise;
-    }
-    await this.writePromise;
+    if (this.flushPromise) return this.flushPromise;
+    this.flushPromise = Promise.resolve().then(async () => {
+      try {
+        while (this.filePath && this.dirty) {
+          this.dirty = false;
+          try {
+            await this.persist(this.snapshot());
+          } catch (error) {
+            this.dirty = true;
+            this.onError("sessions.write_failed", error);
+            throw error;
+          }
+        }
+      } finally {
+        this.flushPromise = null;
+      }
+    });
+    return this.flushPromise;
   }
 
   private digest(id: string): string {
@@ -172,7 +181,7 @@ export class SessionStore {
     if (this.writeTimer) return;
     this.writeTimer = setTimeout(() => {
       this.writeTimer = null;
-      void this.flush();
+      void this.flush().catch(() => undefined);
     }, this.writeDelayMs);
     this.writeTimer.unref?.();
   }

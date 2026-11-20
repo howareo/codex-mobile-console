@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'codex-binary-update.ps1')
+. (Join-Path $PSScriptRoot 'get-managed-app-server.ps1')
 $resolvedRuntime = [System.IO.Path]::GetFullPath($RuntimeDir)
 $logPath = Join-Path $resolvedRuntime 'cutover.log'
 $url = [Uri]$ListenUrl
@@ -28,11 +29,7 @@ function Get-AppServerListener {
 
 function Get-VerifiedAppServerOwner($Listener) {
   if (-not $Listener) { return $null }
-  $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($Listener.OwningProcess)"
-  if ($Listener.LocalAddress -notin @('127.0.0.1', '::1') -or $owner.Name -ine 'codex.exe' -or $owner.CommandLine -notmatch '\bapp-server\b') {
-    throw "端口 $($url.Port) 不是共享 Codex app-server，已停止切换。"
-  }
-  return $owner
+  return Resolve-ManagedAppServerOwner -Port $url.Port
 }
 
 $sourceBinary = Resolve-CodexBinary -CandidatePath $CodexBinary

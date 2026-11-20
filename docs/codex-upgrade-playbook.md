@@ -25,6 +25,15 @@ pwsh -File .\scripts\diagnose-codex-stack.ps1
 pwsh -File .\scripts\show-autostart-status.ps1
 ```
 
+升级后还应核对协议是否漂移（只生成 JSON schema 到临时目录，不启动任何服务）：
+
+```powershell
+pwsh -File .\scripts\test-app-server-protocol-drift.ps1            # 默认取 4500 正在运行的 codex.exe
+pwsh -File .\scripts\test-app-server-protocol-drift.ps1 -CodexPath C:\path\to\codex.exe
+```
+
+脚本调用 `codex.exe app-server generate-json-schema --out <临时目录>`，把 `ClientRequest.json` 中的请求方法与 `src\protocol\app-server-client.ts` 里 `CLIENT_METHODS`（加 `initialize`）比对；有缺失方法时列出并以退出码 1 结束。Claude 后端的 SDK 与本机 CLI 版本对照见已登录网关的 `/api/diagnostics/status` 中的 `claude` 字段（`match=false` 表示 CLI 已自动更新到与 SDK 不同的版本）。
+
 看到 `healthz=200`、`readyz=200` 且版本正常时，继续使用桌面端即可。看到配置 `readable=false`，先修复配置文件本身；看到 `pending`，关闭桌面端和手机页面后让看门自动在维护窗口重载。不要直接杀 4500，也不要编辑会话数据库。
 
 ## 回滚原则

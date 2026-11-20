@@ -5,7 +5,6 @@ const CACHE_PREFIX = "codex-mobile:";
 const MAX_CACHE_BYTES = 128 * 1024;
 const MAX_DRAFT_BYTES = 32 * 1024;
 const MAX_DRAFT_BYTES_PER_THREAD = 8 * 1024;
-const MAX_MODEL_OVERRIDES = 100;
 
 export interface AuthSessionInfo {
   ok: true;
@@ -72,8 +71,8 @@ export function readClientCache(storage: StorageLike, origin: string, build: str
       expiresAt: parsed.expiresAt,
       threads: parsed.threads.map(pickThreadFields),
       drafts: sanitizeDrafts(parsed.drafts),
-      modelOverrides: sanitizeModelOverrides(parsed.modelOverrides),
-      reasoningOverrides: sanitizeModelOverrides(parsed.reasoningOverrides),
+      modelOverrides: {},
+      reasoningOverrides: {},
       lastThreadId: typeof parsed.lastThreadId === "string" ? parsed.lastThreadId : null
     };
   } catch {
@@ -81,15 +80,15 @@ export function readClientCache(storage: StorageLike, origin: string, build: str
   }
 }
 
-export function writeClientCache(storage: StorageLike, origin: string, build: string, session: AuthSessionInfo, threads: ThreadSummary[], drafts: Record<string, string>, modelOverrides: Record<string, string>, reasoningOverrides: ReasoningOverrides, lastThreadId: string | null): void {
+export function writeClientCache(storage: StorageLike, origin: string, build: string, session: AuthSessionInfo, threads: ThreadSummary[], drafts: Record<string, string>, lastThreadId: string | null): void {
   const key = cacheNamespace(origin, build, session.epoch);
   const record: ClientCache = {
     version: CACHE_VERSION,
     expiresAt: session.expiresAt,
     threads: threads.filter(thread => typeof thread.id === "string" && thread.id.length > 0).map(pickThreadFields),
     drafts: sanitizeDrafts(drafts),
-    modelOverrides: sanitizeModelOverrides(modelOverrides),
-    reasoningOverrides: sanitizeModelOverrides(reasoningOverrides),
+    modelOverrides: {},
+    reasoningOverrides: {},
     lastThreadId
   };
   try {
@@ -166,17 +165,6 @@ function sanitizeDrafts(drafts: Record<string, string>): Record<string, string> 
     if (!draft || draft.length > MAX_DRAFT_BYTES_PER_THREAD || total + draft.length > MAX_DRAFT_BYTES) continue;
     result[threadId] = draft;
     total += draft.length;
-  }
-  return result;
-}
-
-function sanitizeModelOverrides(value: unknown): Record<string, string> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  const result: Record<string, string> = {};
-  for (const [threadId, model] of Object.entries(value)) {
-    if (Object.keys(result).length >= MAX_MODEL_OVERRIDES || !threadId || typeof model !== "string") continue;
-    if (typeof model === "string" && (!model.trim() || model.length > 200)) continue;
-    result[threadId] = model;
   }
   return result;
 }
