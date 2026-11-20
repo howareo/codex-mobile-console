@@ -62,11 +62,15 @@ export function ClaudeRunProgress({ run }: { run: ClaudeRunSnapshot }) {
     return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", update); };
   }, [run.requestId, run.finishedAt]);
   const tasks = run.tasks || [];
-  return <details className="claude-run-metrics">
-    <summary><span>{run.status === "approval" ? "等待确认" : run.finishedAt === null ? "运行中" : run.status === "completed" ? "已完成" : run.status === "failed" ? "执行失败" : "已停止"} <time>{claudeElapsed(run.startedAt, run.finishedAt ?? now)}</time></span>
+  const waiting = run.finishedAt === null && run.status !== "approval" && now - (run.lastActivityAt ?? run.startedAt) >= 60_000;
+  return <><details className="claude-run-metrics">
+    <summary><span>{run.status === "approval" ? "等待确认" : run.status === "retrying" ? "上游重试中" : run.finishedAt === null ? "运行中" : run.status === "completed" ? "已完成" : run.status === "failed" ? "执行失败" : "已停止"} <time>{claudeElapsed(run.startedAt, run.finishedAt ?? now)}</time></span>
       <span>{run.usage ? `Token ${tokenText(claudeTokenTotal(run.usage))}` : "Token 统计中"}</span>{tasks.length > 0 && <span>子任务 {tasks.filter(task => task.status === "completed").length}/{tasks.length}</span>}</summary>
     <div className="claude-usage-detail">{run.usage && <><span>输入 {tokenText(run.usage.inputTokens)}</span><span>输出 {tokenText(run.usage.outputTokens)}</span><span>缓存读取 {tokenText(run.usage.cacheReadTokens)}</span><span>缓存写入 {tokenText(run.usage.cacheWriteTokens)}</span></>}<small>随 CLI 用量事件实时更新；尚未上报的 Token 不估算。这里合计已报告的主会话和子任务消息用量，不再叠加子任务卡片数字。</small></div>
-  </details>;
+  </details>{run.finishedAt === null && (run.retry || waiting) && <div className="claude-run-feedback" role="status">
+    {run.retry ? <><strong>上游请求失败 · 重试 {run.retry.attempt}/{run.retry.maxRetries}</strong><span>{run.retry.message} · {run.retry.nextRetryAt > now ? `${Math.ceil((run.retry.nextRetryAt - now) / 1000)} 秒后重试` : "正在等待重试响应"}</span></> : <strong>已 {claudeElapsed(run.lastActivityAt ?? run.startedAt, now)} 未收到新进度</strong>}
+    <small>耗时不代表已有输出；可用停止按钮结束当前任务。</small>
+  </div>}</>;
 }
 
 export function ClaudeTasks({ run }: { run: ClaudeRunSnapshot }) {

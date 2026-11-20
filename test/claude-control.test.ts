@@ -29,6 +29,52 @@ vi.mock("../src/server/claude-settings.js", async importOriginal => ({ ...await 
   localClaudeSettings: vi.fn(async () => ({ effective: {}, models: [] })) }));
 
 describe("Claude mobile control", () => {
+  it("exposes upstream retries immediately and returns to running only after output", async () => {
+    let resume!: () => void;
+    let finish!: () => void;
+    const retryWait = new Promise<void>(resolve => { resume = resolve; });
+    const outputWait = new Promise<void>(resolve => { finish = resolve; });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const factory: ClaudeRunner = () => Object.assign((async function* () {
+      yield frame({ type: "system", subtype: "init" });
+      yield frame({ type: "system", subtype: "api_retry", attempt: 2, max_retries: 5, retry_delay_ms: 1200, error_status: 500, error: "server_error" });
+      await retryWait;
+      yield frame({ type: "stream_event", parent_tool_use_id: null, event: { type: "message_start", message: { id: "recovered" } } });
+      await outputWait;
+      yield result();
+    })(), { close: vi.fn() });
+    const runs = new ClaudeRuns(find, vi.fn(), factory, async () => new Set());
+    try {
+      const run = await runs.send(sessionId, "go", randomUUID());
+      await vi.waitFor(() => expect(run.status).toBe("retrying"));
+      expect((await runs.statuses()).get(sessionId)).toBe("retrying");
+      expect(run.retry).toMatchObject({ attempt: 2, maxRetries: 5, message: "HTTP 500 · 上游请求失败" });
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('"event":"claude.run.retry"'));
+      resume();
+      await vi.waitFor(() => expect(run.status).toBe("running"));
+      expect(run.retry).toBeUndefined();
+      expect(run.lastActivityAt).toBeGreaterThanOrEqual(run.startedAt);
+      finish();
+      await vi.waitFor(() => expect(run.finishedAt).not.toBeNull());
+    } finally { resume(); finish(); runs.close(); }
+  });
+
+  it("reports connection timeouts without an HTTP status", async () => {
+    const factory: ClaudeRunner = (_id, _cwd, _text, controller) => Object.assign((async function* () {
+      yield frame({ type: "system", subtype: "api_retry", attempt: 1, max_retries: 5, retry_delay_ms: 500, error_status: null, error: "unknown" });
+      await new Promise<void>(resolve => controller.signal.addEventListener("abort", () => resolve(), { once: true }));
+    })(), { close: vi.fn() });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const runs = new ClaudeRuns(find, vi.fn(), factory, async () => new Set());
+    try {
+      const run = await runs.send(sessionId, "go", randomUUID());
+      await vi.waitFor(() => expect(run.retry?.message).toContain("连接超时或中断"));
+      runs.stop(sessionId, run.requestId);
+      await vi.waitFor(() => expect(run.status).toBe("stopped"));
+      expect(run.retry).toBeUndefined();
+    } finally { runs.close(); }
+  });
+
   it("inherits session settings, forwards explicit overrides and reports the CLI's actual settings", async () => {
     const { runner } = pendingRunner();
     const source = vi.fn(async () => ({ effective: { model: "session-model", effort: "high" as const, permissionMode: "bypassPermissions" as const }, models: [] }));

@@ -1,7 +1,8 @@
 import type { ClaudeRunSnapshot, ClaudeUsage } from "../../src/shared/claude";
 import { statusClass } from "./thread-items";
 
-export function claudeStatusClass(status: string): ReturnType<typeof statusClass> {
+export function claudeStatusClass(status: string): ReturnType<typeof statusClass> | "retrying" {
+  if (status === "retrying") return "retrying";
   if (["starting", "stopping", "approval"].includes(status)) return "running";
   return statusClass(status === "stopped" ? "interrupted" : status);
 }

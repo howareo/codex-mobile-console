@@ -110,7 +110,7 @@ export class ClaudeRuns {
       const settings = { ...(await this.settings(id)).effective, ...options };
       const run: Run = { snapshot: { sessionId: id, requestId, revision: 0, status: "starting", messages: [
         { id: requestId, items: [{ id: `${requestId}:0`, type: "userMessage", text: safeText(text) }] }
-      ], approvals: [], error: null, startedAt: Date.now(), finishedAt: null, settings, tasks: [] }, controller: new AbortController(), pending: new Map(), streams: new Map(), telemetry: new ClaudeTelemetry() };
+      ], approvals: [], error: null, startedAt: Date.now(), lastActivityAt: Date.now(), finishedAt: null, settings, tasks: [] }, controller: new AbortController(), pending: new Map(), streams: new Map(), telemetry: new ClaudeTelemetry() };
       for (const [key, previous] of this.runs) if (this.runs.size >= 32 && !active(previous)) { this.runs.delete(key); break; }
       for (const [key, previous] of this.requests) if (this.requests.size >= 128 && !active(previous.run)) { this.requests.delete(key); break; }
       this.runs.set(id, run);
@@ -204,6 +204,7 @@ export class ClaudeRuns {
       }
     } finally {
       run.snapshot.finishedAt = Date.now();
+      delete run.snapshot.retry;
       for (const pending of run.pending.values()) pending.resolve(false);
       run.runner?.close();
       if (run.controller.signal.aborted) run.snapshot.status = "stopped";
@@ -214,12 +215,28 @@ export class ClaudeRuns {
       }
       this.invalidate(id);
       this.publish(run);
-      console.log(JSON.stringify({ event: "claude.run.finished", sessionId: id, requestId: run.snapshot.requestId, status: run.snapshot.status }));
+      console.log(JSON.stringify({ timestamp: new Date().toISOString(), event: "claude.run.finished", sessionId: id, requestId: run.snapshot.requestId, status: run.snapshot.status, error: run.snapshot.error }));
     }
   }
 
   private receive(run: Run, message: SDKMessage): void {
     const snapshot = run.snapshot;
+    if (message.type === "system" && message.subtype === "api_retry") {
+      const reason = message.error_status === null ? "连接超时或中断，上游未返回有效响应"
+        : `HTTP ${message.error_status} · ${message.error === "rate_limit" ? "请求限流" : message.error === "overloaded" ? "上游繁忙" : "上游请求失败"}`;
+      snapshot.retry = { attempt: message.attempt, maxRetries: message.max_retries,
+        nextRetryAt: Date.now() + message.retry_delay_ms, message: reason };
+      if (!run.pending.size && !run.controller.signal.aborted) snapshot.status = "retrying";
+      console.warn(JSON.stringify({ timestamp: new Date().toISOString(), event: "claude.run.retry", sessionId: snapshot.sessionId,
+        requestId: snapshot.requestId, ...snapshot.retry }));
+      this.publish(run);
+      return;
+    }
+    if (["assistant", "stream_event", "tool_progress", "result"].includes(message.type)) {
+      snapshot.lastActivityAt = Date.now();
+      delete snapshot.retry;
+      if (snapshot.status === "retrying") snapshot.status = run.pending.size ? "approval" : "running";
+    }
     run.telemetry.receive(snapshot, message, run.streams);
     const parent = "parent_tool_use_id" in message ? message.parent_tool_use_id : null;
     const messages = parent ? run.telemetry.task(snapshot, parent).messages : snapshot.messages;

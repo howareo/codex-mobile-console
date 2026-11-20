@@ -245,7 +245,7 @@ export function ClaudeView({ request, drafts, onDraftChange, onConversationChang
           {page.messages.length === 0 && <div className="empty-state compact"><p>暂无可见历史</p></div>}
           <ThreadMessages items={page.messages.flatMap(message => message.items)} />
           {run && (running || liveMessages.length > 0) && <section className="turn claude-live-turn" aria-label="Claude 当前任务">
-            <div className={`turn-label ${run.status === "failed" ? "failed" : running ? "running" : "done"}`}><span>{running && <LoaderCircle className="spin" size={13} />} Claude · {statusText(run.status)}</span></div>
+            <div className={`turn-label ${run.status === "failed" ? "failed" : run.status === "retrying" ? "retrying" : running ? "running" : "done"}`}><span>{running && <LoaderCircle className="spin" size={13} />} Claude · {statusText(run.status)}</span></div>
             <ThreadMessages items={liveMessages.flatMap(message => message.items)} active={running} />
           </section>}
         </div>
@@ -292,7 +292,7 @@ function hasConversation(message: { items: unknown[] }): boolean {
 }
 
 function statusText(status: string): string {
-  return ({ starting: "正在启动", running: "运行中", approval: "等待审批", stopping: "正在停止", completed: "已完成", stopped: "已停止", failed: "执行失败", external: "电脑端占用", unknown: "未接管" } as Record<string, string>)[status] || "状态未知";
+  return ({ starting: "正在启动", running: "运行中", retrying: "上游重试中", approval: "等待审批", stopping: "正在停止", completed: "已完成", stopped: "已停止", failed: "执行失败", external: "电脑端占用", unknown: "未接管" } as Record<string, string>)[status] || "状态未知";
 }
 
 function errorText(cause: unknown): string {

@@ -11,6 +11,23 @@ const frame = (value: unknown) => value as SDKMessage;
 function snapshot(): ClaudeRunSnapshot { return { sessionId: "session", requestId: "request", revision: 0, status: "running", messages: [], approvals: [], error: null, startedAt: 1000, finishedAt: null, tasks: [] }; }
 
 describe("Claude live telemetry", () => {
+  it("shows retry details and quiet waits instead of equating elapsed time with progress", () => {
+    const run = snapshot();
+    run.status = "retrying";
+    run.retry = { attempt: 4, maxRetries: 5, nextRetryAt: Date.now() - 1, message: "HTTP 500 · 上游请求失败" };
+    let html = renderToStaticMarkup(createElement(ClaudeRunProgress, { run }));
+    expect(html).toContain("上游重试中");
+    expect(html).toContain("重试 4/5");
+    expect(html).toContain("HTTP 500");
+    expect(html).toContain("正在等待重试响应");
+    delete run.retry;
+    run.status = "running";
+    html = renderToStaticMarkup(createElement(ClaudeRunProgress, { run }));
+    expect(html).toContain("未收到新进度");
+    run.finishedAt = Date.now();
+    expect(renderToStaticMarkup(createElement(ClaudeRunProgress, { run }))).not.toContain("未收到新进度");
+  });
+
   it("updates reported streaming tokens without double counting repeated blocks or cumulative resumed totals", () => {
     const run = snapshot(); const tracker = new ClaudeTelemetry(); const streams = new Map([["main", "main-api"], ["agent-tool", "child-api"]]);
     const receive = (message: unknown) => tracker.receive(run, frame(message), streams);

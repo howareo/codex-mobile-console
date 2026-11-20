@@ -4,7 +4,7 @@ export interface ClaudeSessionSummary {
   cwd: string | null;
   updatedAt: number;
   pending?: boolean;
-  status: "unknown" | "running" | "approval" | "completed" | "stopped" | "failed" | "external";
+  status: "unknown" | "running" | "retrying" | "approval" | "completed" | "stopped" | "failed" | "external";
 }
 
 export interface ClaudeSessionList {
@@ -67,7 +67,7 @@ export interface ClaudeRunSnapshot {
   sessionId: string;
   requestId: string;
   revision: number;
-  status: "starting" | "running" | "approval" | "stopping" | "completed" | "stopped" | "failed";
+  status: "starting" | "running" | "retrying" | "approval" | "stopping" | "completed" | "stopped" | "failed";
   messages: ClaudeHistoryPage["messages"];
   approvals: ClaudeApproval[];
   error: string | null;
@@ -77,4 +77,6 @@ export interface ClaudeRunSnapshot {
   usage?: ClaudeUsage;
   tasks?: ClaudeTask[];
   models?: ClaudeModel[];
+  lastActivityAt?: number;
+  retry?: { attempt: number; maxRetries: number; nextRetryAt: number; message: string };
 }
